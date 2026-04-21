@@ -6,11 +6,7 @@
   <description>TODO: Package description</description>
   <maintainer email="ubuntu@todo.todo">ubuntu</maintainer>
   <license>Apache-2.0</license>
-<<<<<<< HEAD
-  <exec_depend>drone_camera_pkg</exec_depend>
-=======
   <exec_depend>visual_pkg</exec_depend>
->>>>>>> 30f9ddf (laser_array)
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

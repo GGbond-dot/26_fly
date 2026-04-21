@@ -12,10 +12,7 @@ def generate_launch_description():
     pid_control_pkg_share = FindPackageShare(package='pid_control_pkg').find('pid_control_pkg')
     activity_control_pkg_share = FindPackageShare(package='activity_control_pkg').find('activity_control_pkg')
     pillar_detector_pkg_share = FindPackageShare(package='pillar_detector_pkg').find('pillar_detector_pkg')
-<<<<<<< HEAD
-=======
     visual_pkg_share = FindPackageShare(package='visual_pkg').find('visual_pkg')
->>>>>>> 30f9ddf (laser_array)
     
     # 2. 定义 Launch 文件包含
     fly_carto_launch = IncludeLaunchDescription(
@@ -55,15 +52,11 @@ def generate_launch_description():
         )
     )
 
-<<<<<<< HEAD
-=======
     visual_pkg_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(visual_pkg_share, 'launch', 'visual_pkg.launch.py')
         )
     )
-
->>>>>>> 30f9ddf (laser_array)
     launch_items = [
         fly_carto_launch, # 立即启动
         uart_to_stm32_launch,
@@ -71,10 +64,7 @@ def generate_launch_description():
         position_pid_controller_launch,
         route_test_launch,
         pillar_detector_launch,
-<<<<<<< HEAD
-=======
         visual_pkg_launch,
->>>>>>> 30f9ddf (laser_array)
     ]
 
     return LaunchDescription(launch_items)
