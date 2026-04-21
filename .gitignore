@@ -12,3 +12,11 @@ __pycache__/
 
 # OS files
 .DS_Store
+# 忽略 VS Code 生成的所有缓存
+.vscode/
+# 忽略比赛题目等 PDF 文档
+*.pdf
+# 忽略编译生成的临时文件夹
+build/
+install/
+log/
