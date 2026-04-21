@@ -1,6 +1,6 @@
 # ROS 2 Workspace `src/` Overview
 
-This workspace currently keeps the UAV control path: mapping/localization, waypoint publishing, aircraft PID, the STM32 serial bridge, and `drone_camera_pkg`.
+This workspace currently keeps the UAV control path: mapping/localization, waypoint publishing, aircraft PID, the STM32 serial bridge, and `visual_pkg`.
 
 ## Quick Start
 
@@ -18,7 +18,7 @@ source install/setup.bash
 
 - `bluesea2` publishes `/scan`
 - `activity_control_pkg` publishes `/target_position` and `/active_controller`
-- `drone_camera_pkg` publishes `/fine_data` and `/apriltag_code`
+- `visual_pkg` publishes `/fine_data` and `/apriltag_code`
 - An external ROS 2 node publishes `/route_choice` to select which waypoint group should run
 - `activity_control_pkg` enters visual takeover for selected waypoints, republishes the target with a configured visual-alignment height, and publishes `/visual_takeover_active`
 - `pid_control_pkg` subscribes to `/target_position`, `/height`, `/visual_takeover_active`, and `/fine_data`, then publishes `/target_velocity`
@@ -62,12 +62,14 @@ Visual takeover topics:
 - `/visual_aligned_apriltag_code`
 - `/mission_complete`
 
-### `drone_camera_pkg`
+### `visual_pkg`
 
-Runs camera preview and AprilTag detection only, then publishes:
+Runs visual alignment detection (integrated from `visual_align`) and publishes:
 
 - `/fine_data`: pixel error `[x_px, y_px]`
-- `/apriltag_code`: current tag code
+- `/apriltag_code`: fixed/configured tag code (`apriltag_code` parameter)
+- `/circle_center`: circle center offset relative to image center
+- `/circle_area_ratio`: detected circle area ratio
 
 ### `my_carto_pkg`
 
