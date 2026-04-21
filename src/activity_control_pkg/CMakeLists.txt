@@ -42,6 +42,29 @@ add_executable(route_test_node src/route_test_node.cpp)
 target_link_libraries(route_test_node route_target_publisher)
 ament_target_dependencies(route_test_node rclcpp)
 
+<<<<<<< HEAD
+=======
+# ── 新增：柱子扫描任务节点（独立于 route_target_publisher） ──
+add_executable(pillar_scan_mission src/pillar_scan_mission_node.cpp)
+target_include_directories(pillar_scan_mission PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(pillar_scan_mission
+  rclcpp
+  std_msgs
+  geometry_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  angles
+)
+if(MSVC)
+  target_compile_options(pillar_scan_mission PRIVATE /W4)
+else()
+  target_compile_options(pillar_scan_mission PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+>>>>>>> 30f9ddf (laser_array)
 install(TARGETS route_target_publisher
   EXPORT export_route_target_publisher
   ARCHIVE DESTINATION lib
@@ -52,6 +75,10 @@ install(TARGETS route_target_publisher
 install(TARGETS
   route_target_publisher_node
   route_test_node
+<<<<<<< HEAD
+=======
+  pillar_scan_mission
+>>>>>>> 30f9ddf (laser_array)
   DESTINATION lib/${PROJECT_NAME}
 )
 
