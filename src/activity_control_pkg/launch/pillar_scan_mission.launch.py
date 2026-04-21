@@ -24,6 +24,13 @@ def generate_launch_description():
                 "flight_height_cm": 40.0,
                 "land_height_cm": 4.0,
                 "scan_end_x_cm": 250.0,
+
+                # 访问 + 降落
+                "landing_x_cm": 250.0,
+                "landing_y_cm": -250.0,
+                "pillar_visit_height_cm": 150.0,
+                "pillar_hover_sec": 1.0,
+                "pillar_wait_timeout_sec": 3.0,
             }],
         )
     ])

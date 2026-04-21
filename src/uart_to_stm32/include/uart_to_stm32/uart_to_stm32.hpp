@@ -45,6 +45,8 @@ private:
   void publishDeliveryCommand();
   void visualAlignedAprilTagCodeCallback(const std_msgs::msg::UInt8::SharedPtr msg);
   void missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr msg);
+  void laserGroundHeightCallback(const std_msgs::msg::Int16::SharedPtr msg);
+  void sendLaserGroundHeightToSerial(int16_t height_cm);
   void protocolDataHandler(uint8_t id, const std::vector<uint8_t> & data);
 
   rclcpp::Node::SharedPtr node_;
@@ -60,6 +62,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr target_velocity_sub_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr visual_aligned_apriltag_code_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr mission_complete_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr laser_ground_height_sub_;
 
   std::unique_ptr<serial_comm::SerialComm> serial_comm_;
 
@@ -83,6 +86,7 @@ private:
   static constexpr uint8_t APRILTAG_CODE_FRAME_ID = 0x11;
   static constexpr uint8_t MISSION_COMPLETE_FRAME_ID = 0x66;
   static constexpr uint8_t MISSION_COMPLETE_VALUE = 0x06;
+  static constexpr uint8_t LASER_GROUND_HEIGHT_FRAME_ID = 0x07;  // 2B int16 little-endian, 单位 cm
 };
 
 }  // 命名空间 uart_to_stm32

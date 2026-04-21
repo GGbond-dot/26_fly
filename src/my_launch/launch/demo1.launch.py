@@ -57,7 +57,6 @@ def generate_launch_description():
             os.path.join(visual_pkg_share, 'launch', 'visual_pkg.launch.py')
         )
     )
-
     launch_items = [
         fly_carto_launch, # 立即启动
         uart_to_stm32_launch,

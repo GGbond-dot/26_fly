@@ -98,6 +98,11 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
       "/mission_complete", rclcpp::QoS(10),
       std::bind(&UartToStm32::missionCompleteCallback, this, std::placeholders::_1));
 
+    // 面阵激光地面高度（Int16 cm）转发到飞控，帧 ID 0x07
+    laser_ground_height_sub_ = node_->create_subscription<std_msgs::msg::Int16>(
+      "/laser_array/ground_height", rclcpp::QoS(10),
+      std::bind(&UartToStm32::laserGroundHeightCallback, this, std::placeholders::_1));
+
     delivery_command_pub_ = node_->create_publisher<std_msgs::msg::String>("/delivery_command", rclcpp::QoS(10));
     height_pub_ = node_->create_publisher<std_msgs::msg::Int16>("/height", 10);
     is_st_ready_pub_ =
@@ -505,6 +510,36 @@ void UartToStm32::visualAlignedAprilTagCodeCallback(const std_msgs::msg::UInt8::
     std::bind(&UartToStm32::publishDeliveryCommand, this));
   delivery_command_active_ = true;
   RCLCPP_INFO(node_->get_logger(), "Started publishing /delivery_command='A' at 1 Hz.");
+}
+
+void UartToStm32::laserGroundHeightCallback(const std_msgs::msg::Int16::SharedPtr msg)
+{
+  sendLaserGroundHeightToSerial(msg->data);
+}
+
+void UartToStm32::sendLaserGroundHeightToSerial(int16_t height_cm)
+{
+  if (!serial_comm_ || !serial_comm_->is_open()) {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+      "Serial port is not open, cannot send laser ground height");
+    return;
+  }
+
+  std::vector<uint8_t> data(2);
+  data[0] = static_cast<uint8_t>(height_cm & 0xFF);
+  data[1] = static_cast<uint8_t>((height_cm >> 8) & 0xFF);
+
+  if (serial_comm_->send_protocol_data(
+        LASER_GROUND_HEIGHT_FRAME_ID, static_cast<uint8_t>(data.size()), data)) {
+    RCLCPP_DEBUG_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+      "Sent laser ground height: %d cm (id=0x%02X)",
+      static_cast<int>(height_cm),
+      static_cast<unsigned>(LASER_GROUND_HEIGHT_FRAME_ID));
+  } else {
+    RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+      "Failed to send laser ground height: %s",
+      serial_comm_->get_last_error().c_str());
+  }
 }
 
 void UartToStm32::missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr)

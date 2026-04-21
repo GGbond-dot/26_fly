@@ -5,13 +5,14 @@
 // 同时提供障碍检测供搬运/避障逻辑使用。
 //
 // 发布的话题：
-//   /laser_array/ground_height    (Float32, 单位: m)   给飞控的稳定高度
+//   /laser_array/ground_height    (Int16,   单位: cm)  给飞控/航点的稳定高度（与飞控 /height 语义对齐）
 //   /laser_array/min_range        (Float32, 单位: m)   16 束中最小值（可能打到障碍/高台顶）
 //   /laser_array/obstacle_below   (Bool)               下方是否有明显低于地面的物体
 //   /laser_array/raw_percentile   (Float32)            滤波前的原始分位值（调参观察用）
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float32.hpp>
+#include <std_msgs/msg/int16.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <boost/asio.hpp>
 #include <algorithm>
@@ -81,7 +82,7 @@ class GroundHeightNode : public rclcpp::Node {
     percentile_ = std::clamp(percentile_, 0.0, 1.0);
     ema_alpha_ = std::clamp(ema_alpha_, 0.0, 1.0);
 
-    ground_pub_ = create_publisher<std_msgs::msg::Float32>("/laser_array/ground_height", 10);
+    ground_pub_ = create_publisher<std_msgs::msg::Int16>("/laser_array/ground_height", 10);
     min_pub_ = create_publisher<std_msgs::msg::Float32>("/laser_array/min_range", 10);
     raw_pub_ = create_publisher<std_msgs::msg::Float32>("/laser_array/raw_percentile", 10);
     obstacle_pub_ = create_publisher<std_msgs::msg::Bool>("/laser_array/obstacle_below", 10);
@@ -101,8 +102,11 @@ class GroundHeightNode : public rclcpp::Node {
         return;
       }
       RCLCPP_INFO(get_logger(),
-                  "[height] out=%.3fm raw=%.3fm min=%.3fm valid=%d bimodal=%d hold=%d obstacle=%d",
-                  last_output_, last_raw_, last_min_, last_valid_count_,
+                  "[height] out=%dcm raw=%dcm min=%dcm valid=%d bimodal=%d hold=%d obstacle=%d",
+                  static_cast<int>(std::lround(last_output_ * 100.0f)),
+                  static_cast<int>(std::lround(last_raw_    * 100.0f)),
+                  static_cast<int>(std::lround(last_min_    * 100.0f)),
+                  last_valid_count_,
                   last_bimodal_ ? 1 : 0, last_hold_counter_,
                   last_obstacle_ ? 1 : 0);
     });
@@ -159,7 +163,7 @@ class GroundHeightNode : public rclcpp::Node {
   rclcpp::Time last_stamp_;
 
   // 发布器 + 日志定时器
-  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr ground_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr ground_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr min_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr raw_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr obstacle_pub_;
@@ -244,7 +248,7 @@ class GroundHeightNode : public rclcpp::Node {
     }
 
     if (valid.empty()) {
-      publishFloat(ground_pub_, std::numeric_limits<float>::quiet_NaN());
+      // 无有效束：跳过这一帧，不发布 ground_height（Int16 无 NaN 表达）
       return;
     }
 
@@ -333,7 +337,10 @@ class GroundHeightNode : public rclcpp::Node {
       hold_ctr = hold_counter_;
     }
     (void)hold_ctr;
-    publishFloat(ground_pub_, output);
+    // m → cm (Int16)，四舍五入
+    std_msgs::msg::Int16 gh;
+    gh.data = static_cast<int16_t>(std::lround(output * 100.0f));
+    ground_pub_->publish(gh);
   }
 
   void publishFloat(const rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr& pub,

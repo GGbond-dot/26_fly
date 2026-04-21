@@ -13,6 +13,7 @@ def generate_launch_description():
     activity_control_pkg_share = FindPackageShare(package='activity_control_pkg').find('activity_control_pkg')
     pillar_detector_pkg_share = FindPackageShare(package='pillar_detector_pkg').find('pillar_detector_pkg')
     visual_pkg_share = FindPackageShare(package='visual_pkg').find('visual_pkg')
+    laser_array_pkg_share = FindPackageShare(package='laser_array_pkg').find('laser_array_pkg')
 
     # 2. Launch 文件
     fly_carto_launch = IncludeLaunchDescription(
@@ -49,6 +50,14 @@ def generate_launch_description():
         )
     )
 
+    # 面阵激光地面高度（抗高台版），发布 /laser_array/ground_height
+    # 注意：与 laser_array.launch.py 里的原 driver 互斥，同一时间只能起一个
+    laser_array_ground_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(laser_array_pkg_share, 'launch', 'laser_array_ground.launch.py')
+        )
+    )
+
     launch_items = [
         fly_carto_launch,
         uart_to_stm32_launch,
@@ -56,6 +65,7 @@ def generate_launch_description():
         pillar_scan_mission_launch,
         pillar_detector_tf_launch,
         visual_pkg_launch,
+        laser_array_ground_launch,
     ]
 
     return LaunchDescription(launch_items)
