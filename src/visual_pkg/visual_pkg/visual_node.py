@@ -35,6 +35,8 @@ class VisualNode(Node):
         self.declare_parameter("process_fps", 15.0)
         self.declare_parameter("show_display", False)
         self.declare_parameter("apriltag_code", -1)
+        # center_source: "circle" (默认，兼容 demo2) | "square" (demo3 抓取对准用方框几何中心)
+        self.declare_parameter("center_source", "circle")
 
         cam_idx = int(self.get_parameter("camera_index").value)
         width = int(self.get_parameter("width").value)
@@ -42,6 +44,8 @@ class VisualNode(Node):
         cam_fps = int(self.get_parameter("camera_fps").value)
         process_fps = float(self.get_parameter("process_fps").value)
         self._show = bool(self.get_parameter("show_display").value)
+        src = str(self.get_parameter("center_source").value).strip().lower()
+        self._center_source = "square" if src == "square" else "circle"
 
         self._config = DetectorConfig()
         self._tracker = StableRectangleTracker(
@@ -188,22 +192,36 @@ class VisualNode(Node):
 
         fine_x_px = 0
         fine_y_px = 0
-        if circle_for_pub is not None:
-            cx, cy = circle_for_pub["center"]
-            dx = float(cx) - frame_w / 2.0
-            dy = float(cy) - frame_h / 2.0
+
+        # 发布中心选择：square=方框几何中心(抓取/放置对准)，circle=圆心(默认兼容 demo2)
+        center_xy: Optional[tuple] = None
+        if self._center_source == "square":
+            if state.polygon is not None:
+                poly = state.polygon.reshape(-1, 2)
+                center_xy = (float(poly[:, 0].mean()), float(poly[:, 1].mean()))
+        else:
+            if circle_for_pub is not None:
+                center_xy = (float(circle_for_pub["center"][0]),
+                             float(circle_for_pub["center"][1]))
+
+        if center_xy is not None:
+            cx, cy = center_xy
+            dx = cx - frame_w / 2.0
+            dy = cy - frame_h / 2.0
             pt.point.x = dx
             pt.point.y = dy
             pt.point.z = 0.0
             fine_x_px = int(round(dx))
             fine_y_px = int(round(dy))
-
-            ratio_val = circle_for_pub.get("ratio_smooth", circle_for_pub.get("ratio", math.nan))
-            ratio_msg.data = float(ratio_val)
         else:
             pt.point.x = math.nan
             pt.point.y = math.nan
             pt.point.z = 0.0
+
+        if circle_for_pub is not None:
+            ratio_val = circle_for_pub.get("ratio_smooth", circle_for_pub.get("ratio", math.nan))
+            ratio_msg.data = float(ratio_val)
+        else:
             ratio_msg.data = math.nan
 
         self._pub_center.publish(pt)

@@ -62,6 +62,26 @@ else()
   target_compile_options(pillar_scan_mission PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# ── 柱子抓取任务节点（demo3 使用） ──
+add_executable(pillar_pickup_mission src/pillar_pickup_mission_node.cpp)
+target_include_directories(pillar_pickup_mission PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(pillar_pickup_mission
+  rclcpp
+  std_msgs
+  geometry_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  angles
+)
+if(MSVC)
+  target_compile_options(pillar_pickup_mission PRIVATE /W4)
+else()
+  target_compile_options(pillar_pickup_mission PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 install(TARGETS route_target_publisher
   EXPORT export_route_target_publisher
   ARCHIVE DESTINATION lib
@@ -73,6 +93,7 @@ install(TARGETS
   route_target_publisher_node
   route_test_node
   pillar_scan_mission
+  pillar_pickup_mission
   DESTINATION lib/${PROJECT_NAME}
 )
 
