@@ -11,8 +11,10 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/empty.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/int16.hpp>
+#include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 #include <tf2_ros/buffer.h>
@@ -62,13 +64,17 @@ enum class PickupPhase
 
 enum class PickupSub
 {
-  APPROACH,       // 飞到 (px, py, 150) 上方
-  ALIGN1,         // 视觉对准 + 双激光采样
-  DESCEND_MID,    // 面阵下降到 pillar_top + 30cm
-  ALIGN2,         // 近距短视觉对准 (best-effort)
-  DESCEND_FINAL,  // 盲降到 pillar_top + Δgrab
-  HOVER_GRAB,     // 抓取/放置预留
-  CLIMB_BACK      // 爬回 150cm
+  APPROACH,           // 飞到 (px, py, 150) 上方
+  ALIGN1,             // 视觉对准 + 双激光采样
+  DESCEND_MID,        // 面阵下降到 pillar_top + 30cm
+  ALIGN2,             // 近距短视觉对准 (best-effort)
+  DESCEND_FINAL,      // 盲降到 pillar_top + Δgrab（= 铁片上方 20cm）
+  HOVER_GRAB,         // 到位发抓取信号给飞控 + 吸磁，悬停
+  CLIMB_BACK,         // 爬回巡航高度
+  GOTO_DROP,          // 飞到空柱子 xy，巡航高度
+  DESCEND_DROP,       // 下降到空柱上方 20cm
+  HOVER_DROP,         // 到位发放置信号给飞控 + 松磁，悬停
+  CLIMB_AFTER_DROP    // 爬回巡航高度
 };
 
 class PillarPickupMissionNode : public rclcpp::Node
@@ -82,6 +88,7 @@ private:
   void pointHeightCallback(const std_msgs::msg::Int16::SharedPtr msg);
   void pillarsCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
   void fineDataCallback(const std_msgs::msg::Int32MultiArray::SharedPtr msg);
+  void circleRatioCallback(const std_msgs::msg::Float32::SharedPtr msg);
   void monitorTimerCallback();
 
   // ── 姿态 / 到位判定 ──
@@ -90,10 +97,15 @@ private:
                  double z_cm, double yaw_deg) const;
 
   // ── 发布 ──
-  void publishTarget(const PickupWaypoint & wp);
+  void publishTarget(const PickupWaypoint & wp, bool verbose = true);
   void publishEnable(bool on);
   void publishVisualTakeover(bool on);
   void publishActiveController(uint8_t mode);
+  // 通过 uart_to_stm32 的 /arm_control 通道告诉飞控机械臂动作：
+  // 1 = 伸出，0 = 收回。
+  void publishArmAction(uint8_t code);
+  // 控制电磁铁：on=true 吸住，on=false 松开。magnet_control 节点 IO 低电平有效。
+  void publishMagnet(bool on);
 
   // ── SCAN / LAND 路线构造 ──
   std::vector<std::pair<double, double>> greedyOrder(
@@ -158,6 +170,8 @@ private:
   double mid_clearance_cm_;           // DESCEND_MID 目标: pillar_top + 此值（对应面阵读数附加项）
   double grab_clearance_cm_;          // DESCEND_FINAL 目标: pillar_top + 此值
   double hover_grab_sec_;             // 抓取/放置占位悬停时间
+  bool   traverse_only_mode_;         // true: 仅遍历柱子，完成后直接去终点
+  double target_republish_period_sec_; // 目标重发周期（秒），用于跨节点启动时序抖动
 
   // ── 状态 ──
   PickupPhase phase_;
@@ -193,6 +207,20 @@ private:
   bool pillars_received_;
   rclcpp::Time wait_pillars_start_time_;
 
+  // 空柱子（距 landing 点 B 最近的那根，作为放置目标）
+  double empty_pillar_x_cm_ = 0.0;
+  double empty_pillar_y_cm_ = 0.0;
+  bool   has_empty_pillar_  = false;
+  double empty_pillar_height_cm_ = 0.0;
+  bool   has_empty_pillar_height_ = false;
+
+  // 是否正在携带铁片（HOVER_GRAB 完成到 HOVER_DROP 完成之间为 true）
+  bool carrying_plate_ = false;
+
+  // visual_pkg 的铁片面积占比，仅用于采样期间记录，不影响状态机
+  double last_circle_ratio_ = 0.0;
+  bool   has_circle_ratio_  = false;
+
   // 是否在 SCAN 的某段上悬停计时
   bool is_hovering_;
   rclcpp::Time hover_start_time_;
@@ -210,14 +238,21 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                 enable_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                 visual_takeover_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr                active_controller_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr                route_choice_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr                arm_action_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr                magnet_cmd_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr                mission_complete_pub_;
 
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr             area_height_sub_;
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr             point_height_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pillars_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32MultiArray>::SharedPtr   fine_data_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr           circle_ratio_sub_;
 
   rclcpp::TimerBase::SharedPtr                                      monitor_timer_;
+  rclcpp::TimerBase::SharedPtr                                      target_republish_timer_;
+  rclcpp::TimerBase::SharedPtr                                      route_choice_kick_timer_;
+  int                                                               route_choice_kick_count_ = 0;
 
   std::shared_ptr<tf2_ros::Buffer>            tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;

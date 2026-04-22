@@ -18,7 +18,7 @@ namespace
 {
 bool isSupportedRouteChoice(uint8_t route_id)
 {
-  return route_id == 1 || route_id == 2;
+  return route_id == 1 || route_id == 2 || route_id == 3;
 }
 }  // namespace
 
@@ -93,6 +93,10 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
       "/visual_aligned_apriltag_code", rclcpp::QoS(10),
       std::bind(&UartToStm32::visualAlignedAprilTagCodeCallback, this, std::placeholders::_1));
 
+    arm_control_sub_ = node_->create_subscription<std_msgs::msg::UInt8>(
+      "/arm_control", rclcpp::QoS(10),
+      std::bind(&UartToStm32::armControlCallback, this, std::placeholders::_1));
+
       
     mission_complete_sub_ = node_->create_subscription<std_msgs::msg::Empty>(
       "/mission_complete", rclcpp::QoS(10),
@@ -121,7 +125,7 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
     RCLCPP_INFO(node_->get_logger(), "UartToStm32 initialized successfully");
     RCLCPP_INFO(
       node_->get_logger(),
-      "Subscribed to /velocity_map, /route_choice, /target_velocity, /visual_aligned_apriltag_code, and /mission_complete topics");
+      "Subscribed to /velocity_map, /route_choice, /target_velocity, /visual_aligned_apriltag_code, /arm_control, and /mission_complete topics");
     return true;
 
   } catch (const std::exception & e) {
@@ -447,6 +451,32 @@ void UartToStm32::sendAprilTagCodeToSerial(uint8_t apriltag_code)
   }
 }
 
+void UartToStm32::sendArmControlToSerial(uint8_t arm_state)
+{
+  if (!serial_comm_ || !serial_comm_->is_open()) {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 5000,
+      "Serial port is not open, cannot send arm control data");
+    return;
+  }
+
+  const uint8_t payload = arm_state == 1 ? 1 : 0;
+  std::vector<uint8_t> data(1, payload);
+  if (serial_comm_->send_protocol_data(ARM_CONTROL_FRAME_ID, static_cast<uint8_t>(data.size()), data)) {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Sent arm control frame: id=0x%02X state=%u (%s)",
+      static_cast<unsigned>(ARM_CONTROL_FRAME_ID),
+      static_cast<unsigned>(payload),
+      payload == 1 ? "extend" : "retract");
+  } else {
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "Failed to send arm control frame: %s",
+      serial_comm_->get_last_error().c_str());
+  }
+}
+
 void UartToStm32::sendMissionCompleteToSerial()
 {
   if (!serial_comm_ || !serial_comm_->is_open()) {
@@ -490,12 +520,12 @@ void UartToStm32::visualAlignedAprilTagCodeCallback(const std_msgs::msg::UInt8::
 {
   RCLCPP_INFO(
     node_->get_logger(),
-    "Received aligned AprilTag code %u. Sending frame 0x%02X three times.",
+    "Received aligned AprilTag code %u. Sending arm extend frame 0x%02X three times.",
     static_cast<unsigned>(msg->data),
-    static_cast<unsigned>(APRILTAG_CODE_FRAME_ID));
+    static_cast<unsigned>(ARM_CONTROL_FRAME_ID));
 
   for (int i = 0; i < 3; ++i) {
-    sendAprilTagCodeToSerial(msg->data);
+    sendArmControlToSerial(1);
     std::this_thread::sleep_for(100ms);
   }
   
@@ -510,6 +540,21 @@ void UartToStm32::visualAlignedAprilTagCodeCallback(const std_msgs::msg::UInt8::
     std::bind(&UartToStm32::publishDeliveryCommand, this));
   delivery_command_active_ = true;
   RCLCPP_INFO(node_->get_logger(), "Started publishing /delivery_command='A' at 1 Hz.");
+}
+
+void UartToStm32::armControlCallback(const std_msgs::msg::UInt8::SharedPtr msg)
+{
+  const uint8_t payload = msg->data == 1 ? 1 : 0;
+  RCLCPP_INFO(
+    node_->get_logger(),
+    "Received /arm_control=%u. Sending frame 0x%02X three times.",
+    static_cast<unsigned>(msg->data),
+    static_cast<unsigned>(ARM_CONTROL_FRAME_ID));
+
+  for (int i = 0; i < 3; ++i) {
+    sendArmControlToSerial(payload);
+    std::this_thread::sleep_for(100ms);
+  }
 }
 
 void UartToStm32::laserGroundHeightCallback(const std_msgs::msg::Int16::SharedPtr msg)

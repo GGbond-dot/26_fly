@@ -567,9 +567,8 @@ std::unordered_map<RouteTestNode::RouteId, std::vector<Target>> RouteTestNode::b
   });
 
   // Route 3: 2026 杭电电赛 X 题基础要求——中心起飞→对角降落
-  // (0,0,13) 升空 → (0,0,150) 爬升 → (250,-250,150) 对角巡航 → (250,-250,13) 对角区降落
+  // 起始态 (0,0,13) 一键起飞：爬升 → 对角巡航 → 对角区降落
   routes.emplace(RouteId{3}, std::vector<Target>{
-    Target{0.0, 0.0, 13.0, 0.0, false},
     Target{0.0, 0.0, 150.0, 0.0, false},
     Target{250.0, -250.0, 150.0, 0.0, false},
     Target{250.0, -250.0, 13.0, 0.0, false},

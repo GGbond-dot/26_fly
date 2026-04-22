@@ -69,6 +69,8 @@ PillarPickupMissionNode::PillarPickupMissionNode(const rclcpp::NodeOptions & opt
   mid_clearance_cm_   = declare_parameter("mid_clearance_cm",   30.0);
   grab_clearance_cm_  = declare_parameter("grab_clearance_cm",   5.0);
   hover_grab_sec_     = declare_parameter("hover_grab_sec",      2.0);
+  traverse_only_mode_ = declare_parameter("traverse_only_mode",  true);
+  target_republish_period_sec_ = declare_parameter("target_republish_period_sec", 1.0);
 
   // ── SCAN 航点 ──
   waypoints_ = {
@@ -85,6 +87,9 @@ PillarPickupMissionNode::PillarPickupMissionNode(const rclcpp::NodeOptions & opt
   enable_pub_            = create_publisher<std_msgs::msg::Bool>("/pillar_detect_enable", durable_qos);
   visual_takeover_pub_   = create_publisher<std_msgs::msg::Bool>("/visual_takeover", durable_qos);
   active_controller_pub_ = create_publisher<std_msgs::msg::UInt8>("/active_controller", durable_qos);
+  route_choice_pub_      = create_publisher<std_msgs::msg::UInt8>("/route_choice", rclcpp::QoS(10).reliable());
+  arm_action_pub_        = create_publisher<std_msgs::msg::UInt8>("/arm_control", rclcpp::QoS(10).reliable());
+  magnet_cmd_pub_        = create_publisher<std_msgs::msg::Int32>("/magnet/cmd", rclcpp::QoS(10).reliable());
   mission_complete_pub_  = create_publisher<std_msgs::msg::Empty>("/mission_complete", rclcpp::QoS(10).reliable());
 
   area_height_sub_ = create_subscription<std_msgs::msg::Int16>(
@@ -96,6 +101,9 @@ PillarPickupMissionNode::PillarPickupMissionNode(const rclcpp::NodeOptions & opt
   fine_data_sub_ = create_subscription<std_msgs::msg::Int32MultiArray>(
     "/fine_data", rclcpp::QoS(10),
     std::bind(&PillarPickupMissionNode::fineDataCallback, this, std::placeholders::_1));
+  circle_ratio_sub_ = create_subscription<std_msgs::msg::Float32>(
+    "/circle_area_ratio", rclcpp::QoS(10),
+    std::bind(&PillarPickupMissionNode::circleRatioCallback, this, std::placeholders::_1));
 
   auto pillars_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
   pillars_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
@@ -110,9 +118,75 @@ PillarPickupMissionNode::PillarPickupMissionNode(const rclcpp::NodeOptions & opt
     std::chrono::milliseconds(50),
     std::bind(&PillarPickupMissionNode::monitorTimerCallback, this));
 
+  if (target_republish_period_sec_ > 0.0) {
+    target_republish_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(target_republish_period_sec_)),
+      [this]() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (phase_ == PickupPhase::DONE || phase_ == PickupPhase::WAIT_PILLARS) {
+          return;
+        }
+
+        if (phase_ == PickupPhase::PICKUP) {
+          switch (sub_) {
+            case PickupSub::APPROACH:
+            case PickupSub::ALIGN1:
+            case PickupSub::DESCEND_MID:
+            case PickupSub::DESCEND_FINAL:
+            case PickupSub::CLIMB_BACK:
+            case PickupSub::GOTO_DROP:
+            case PickupSub::DESCEND_DROP:
+            case PickupSub::CLIMB_AFTER_DROP:
+              publishTarget(sub_target_, false);
+              RCLCPP_INFO_THROTTLE(
+                get_logger(), *get_clock(), 3000,
+                "重发当前子目标 [%s] 以保证 PID 订阅侧不会漏收", sub_target_.tag);
+              break;
+            case PickupSub::ALIGN2:
+            case PickupSub::HOVER_GRAB:
+            case PickupSub::HOVER_DROP:
+              break;
+          }
+          return;
+        }
+
+        if (current_idx_ < waypoints_.size()) {
+          publishTarget(waypoints_[current_idx_], false);
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 3000,
+            "重发当前航点 [%s] 以保证 PID 订阅侧不会漏收", waypoints_[current_idx_].tag);
+        }
+      });
+  }
+
+  // 打开 uart_to_stm32 的 /target_velocity 转发：该节点要求先收到一个受支持的
+  // /route_choice（值 1 或 2）才会把 PID 算出的速度下发到 STM32。pickup 任务本身
+  // 不走 route_target_publisher，所以这里自启一次 /route_choice=1，避免解锁不起飞。
+  // 订阅端是 volatile，启动时序不对就会漏，所以每 500 ms 重发一次，直到发够
+  // 10 次（≈5 s）再停。uart_to_stm32 对重复的 route_choice 是幂等的。
+  route_choice_kick_count_ = 0;
+  route_choice_kick_timer_ = create_wall_timer(
+    std::chrono::milliseconds(500),
+    [this]() {
+      std_msgs::msg::UInt8 m;
+      m.data = 1;
+      route_choice_pub_->publish(m);
+      ++route_choice_kick_count_;
+      if (route_choice_kick_count_ == 1) {
+        RCLCPP_INFO(get_logger(), "已发布 /route_choice=1，启用 uart_to_stm32 目标速度转发");
+      }
+      if (route_choice_kick_count_ >= 10) {
+        route_choice_kick_timer_->cancel();
+      }
+    });
+
   RCLCPP_INFO(get_logger(),
     "PICKUP 任务启动: 起飞 → 扫描 → 每柱子(对准+测高+下降+悬停%.1fs) → 降落(%.0f,%.0f)",
     hover_grab_sec_, landing_x_cm_, landing_y_cm_);
+  RCLCPP_INFO(get_logger(),
+    "任务模式: %s",
+    traverse_only_mode_ ? "traverse_only=true（仅遍历柱子后去终点）" : "full_pick_drop");
   RCLCPP_INFO(get_logger(),
     "激光: 面阵base=%.1fcm 点阵base=%.1fcm mount_diff=%.1fcm",
     LASER_AREA_BASE_CM, LASER_POINT_BASE_CM, LASER_MOUNT_DIFF_CM);
@@ -148,6 +222,24 @@ void PillarPickupMissionNode::pillarsCallback(const std_msgs::msg::Float32MultiA
   }
   pillars_received_ = true;
   RCLCPP_INFO(get_logger(), "收到 /detected_pillars: %zu 个柱子", detected_pillars_cm_.size());
+
+  // 识别"空柱子"：距 landing 点 B 最近的那根。赛题已经固定空柱就是离终点最近的柱子。
+  if (!detected_pillars_cm_.empty()) {
+    std::size_t best_idx = 0;
+    double best_d2 = std::numeric_limits<double>::infinity();
+    for (std::size_t k = 0; k < detected_pillars_cm_.size(); ++k) {
+      const double dx = detected_pillars_cm_[k].first  - landing_x_cm_;
+      const double dy = detected_pillars_cm_[k].second - landing_y_cm_;
+      const double d2 = dx * dx + dy * dy;
+      if (d2 < best_d2) { best_d2 = d2; best_idx = k; }
+    }
+    empty_pillar_x_cm_ = detected_pillars_cm_[best_idx].first;
+    empty_pillar_y_cm_ = detected_pillars_cm_[best_idx].second;
+    has_empty_pillar_  = true;
+    RCLCPP_INFO(get_logger(),
+      "空柱子锁定：#%zu @ (%.1f, %.1f) cm（距 B=(%.0f,%.0f) 最近）",
+      best_idx, empty_pillar_x_cm_, empty_pillar_y_cm_, landing_x_cm_, landing_y_cm_);
+  }
 }
 
 void PillarPickupMissionNode::fineDataCallback(const std_msgs::msg::Int32MultiArray::SharedPtr msg)
@@ -156,9 +248,16 @@ void PillarPickupMissionNode::fineDataCallback(const std_msgs::msg::Int32MultiAr
   recordFineData(static_cast<int>(msg->data[0]), static_cast<int>(msg->data[1]));
 }
 
+void PillarPickupMissionNode::circleRatioCallback(const std_msgs::msg::Float32::SharedPtr msg)
+{
+  if (std::isnan(msg->data)) { return; }
+  last_circle_ratio_ = static_cast<double>(msg->data);
+  has_circle_ratio_  = true;
+}
+
 // ─────────── 发布工具 ───────────
 
-void PillarPickupMissionNode::publishTarget(const PickupWaypoint & wp)
+void PillarPickupMissionNode::publishTarget(const PickupWaypoint & wp, bool verbose)
 {
   std_msgs::msg::Float32MultiArray msg;
   msg.data.resize(4);
@@ -168,9 +267,11 @@ void PillarPickupMissionNode::publishTarget(const PickupWaypoint & wp)
   msg.data[3] = static_cast<float>(wp.yaw_deg);
   target_pub_->publish(msg);
   publishActiveController(2);
-  RCLCPP_INFO(get_logger(),
-    "发布目标 [%s]: x=%.1f y=%.1f z=%.1f yaw=%.1f",
-    wp.tag, wp.x_cm, wp.y_cm, wp.z_cm, wp.yaw_deg);
+  if (verbose) {
+    RCLCPP_INFO(get_logger(),
+      "发布目标 [%s]: x=%.1f y=%.1f z=%.1f yaw=%.1f",
+      wp.tag, wp.x_cm, wp.y_cm, wp.z_cm, wp.yaw_deg);
+  }
 }
 
 void PillarPickupMissionNode::publishEnable(bool on)
@@ -194,6 +295,23 @@ void PillarPickupMissionNode::publishActiveController(uint8_t mode)
   std_msgs::msg::UInt8 m;
   m.data = mode;
   active_controller_pub_->publish(m);
+}
+
+void PillarPickupMissionNode::publishArmAction(uint8_t code)
+{
+  std_msgs::msg::UInt8 m;
+  m.data = code == 1 ? 1 : 0;
+  arm_action_pub_->publish(m);
+  RCLCPP_INFO(get_logger(), "→ /arm_control = %u (机械臂 %s)",
+    static_cast<unsigned>(m.data), m.data == 1 ? "伸出" : "收回");
+}
+
+void PillarPickupMissionNode::publishMagnet(bool on)
+{
+  std_msgs::msg::Int32 m;
+  m.data = on ? 1 : 2;  // magnet_control: 1=on, 2=off
+  magnet_cmd_pub_->publish(m);
+  RCLCPP_INFO(get_logger(), "→ /magnet/cmd = %d (%s)", m.data, on ? "吸" : "松");
 }
 
 // ─────────── 姿态 / 到位 ───────────
@@ -390,14 +508,52 @@ void PillarPickupMissionNode::enterSub(PickupSub s)
     case PickupSub::HOVER_GRAB: {
       sub_hover_start_ = now();
       RCLCPP_INFO(get_logger(),
-        "[pillar %zu] HOVER_GRAB 占位（抓取/放置）: 悬停 %.1fs",
-        pillar_iter_ + 1, hover_grab_sec_);
-      // TODO: 在此处触发机械臂 / 电磁铁抓取；当前仅悬停
+        "[pillar %zu] HOVER_GRAB: 铁片占比=%.3f 发抓取指令 + 吸磁，悬停 %.1fs",
+        pillar_iter_ + 1, has_circle_ratio_ ? last_circle_ratio_ : -1.0, hover_grab_sec_);
+      publishArmAction(1);   // 机械臂伸出，准备抓
+      publishMagnet(true);   // 电磁铁吸
       break;
     }
     case PickupSub::CLIMB_BACK: {
       publishVisualTakeover(false);
       sub_target_ = PickupWaypoint{px, py, pillar_visit_height_cm_, 0.0, 0.0, "climb_back"};
+      publishTarget(sub_target_);
+      break;
+    }
+    case PickupSub::GOTO_DROP: {
+      publishVisualTakeover(false);
+      sub_target_ = PickupWaypoint{
+        empty_pillar_x_cm_, empty_pillar_y_cm_,
+        pillar_visit_height_cm_, 0.0, 0.0, "goto_drop"};
+      publishTarget(sub_target_);
+      break;
+    }
+    case PickupSub::DESCEND_DROP: {
+      publishVisualTakeover(false);
+      // 若空柱高度未知（异常），用当前柱子高度作为兜底，避免 0 cm
+      const double h = has_empty_pillar_height_
+        ? empty_pillar_height_cm_
+        : (has_measured_pillar_height_ ? measured_pillar_height_cm_ : 0.0);
+      const double z_drop = h + LASER_AREA_BASE_CM + grab_clearance_cm_;
+      double tx = empty_pillar_x_cm_, ty = empty_pillar_y_cm_;
+      applyCameraOffsetToTarget(tx, ty, 0.0);
+      sub_target_ = PickupWaypoint{tx, ty, z_drop, 0.0, 0.0, "descend_drop"};
+      publishTarget(sub_target_);
+      break;
+    }
+    case PickupSub::HOVER_DROP: {
+      sub_hover_start_ = now();
+      RCLCPP_INFO(get_logger(),
+        "[pillar %zu] HOVER_DROP: 发放置指令 + 松磁，悬停 %.1fs",
+        pillar_iter_ + 1, hover_grab_sec_);
+      publishArmAction(1);   // 机械臂伸出，准备放
+      publishMagnet(false);  // 电磁铁松
+      break;
+    }
+    case PickupSub::CLIMB_AFTER_DROP: {
+      sub_target_ = PickupWaypoint{
+        empty_pillar_x_cm_, empty_pillar_y_cm_,
+        pillar_visit_height_cm_, 0.0, 0.0, "climb_after_drop"};
       publishTarget(sub_target_);
       break;
     }
@@ -463,7 +619,12 @@ void PillarPickupMissionNode::stepPickup(double x_cm, double y_cm, double z_cm, 
           pillar_height_samples_cm_.size(),
           aligned ? "达成" : "超时",
           elapsed);
-        enterSub(PickupSub::DESCEND_MID);
+        if (traverse_only_mode_) {
+          publishVisualTakeover(false);
+          enterSub(PickupSub::CLIMB_BACK);
+        } else {
+          enterSub(PickupSub::DESCEND_MID);
+        }
       }
       break;
     }
@@ -489,12 +650,52 @@ void PillarPickupMissionNode::stepPickup(double x_cm, double y_cm, double z_cm, 
     }
     case PickupSub::HOVER_GRAB: {
       if ((now() - sub_hover_start_).seconds() >= hover_grab_sec_) {
-        // TODO: 抓取/放置确认
+        carrying_plate_ = true;
         enterSub(PickupSub::CLIMB_BACK);
       }
       break;
     }
     case PickupSub::CLIMB_BACK: {
+      if (isReached(sub_target_, x_cm, y_cm, z_cm, 0.0)) {
+        // full_pick_drop 模式下：如果刚抓了铁片还没放，先去空柱子放
+        if (!traverse_only_mode_ && carrying_plate_ && has_empty_pillar_) {
+          enterSub(PickupSub::GOTO_DROP);
+          break;
+        }
+        ++pillar_iter_;
+        if (pillar_iter_ >= pillars_ordered_cm_.size()) {
+          phase_ = PickupPhase::LAND;
+          current_idx_ = waypoints_.size();
+          waypoints_.push_back(PickupWaypoint{landing_x_cm_, landing_y_cm_, pillar_visit_height_cm_, 0.0, 0.0, "land_approach"});
+          waypoints_.push_back(PickupWaypoint{landing_x_cm_, landing_y_cm_, flight_height_cm_,       0.0, 0.0, "land_hover"});
+          waypoints_.push_back(PickupWaypoint{landing_x_cm_, landing_y_cm_, land_height_cm_,         0.0, 0.0, "land"});
+          publishTarget(waypoints_[current_idx_]);
+        } else {
+          enterSub(PickupSub::APPROACH);
+        }
+      }
+      break;
+    }
+    case PickupSub::GOTO_DROP: {
+      if (isReached(sub_target_, x_cm, y_cm, z_cm, 0.0)) {
+        enterSub(PickupSub::DESCEND_DROP);
+      }
+      break;
+    }
+    case PickupSub::DESCEND_DROP: {
+      if (isReached(sub_target_, x_cm, y_cm, z_cm, 0.0)) {
+        enterSub(PickupSub::HOVER_DROP);
+      }
+      break;
+    }
+    case PickupSub::HOVER_DROP: {
+      if ((now() - sub_hover_start_).seconds() >= hover_grab_sec_) {
+        carrying_plate_ = false;
+        enterSub(PickupSub::CLIMB_AFTER_DROP);
+      }
+      break;
+    }
+    case PickupSub::CLIMB_AFTER_DROP: {
       if (isReached(sub_target_, x_cm, y_cm, z_cm, 0.0)) {
         ++pillar_iter_;
         if (pillar_iter_ >= pillars_ordered_cm_.size()) {
@@ -534,7 +735,8 @@ void PillarPickupMissionNode::monitorTimerCallback()
     if (pillars_received_) {
       pillars_ordered_cm_ = greedyOrder(detected_pillars_cm_, x_cm, y_cm);
       RCLCPP_INFO(get_logger(),
-        "柱子顺序已规划: %zu 个", pillars_ordered_cm_.size());
+        "柱子顺序已规划: %zu 个（按当前位置最近优先遍历）",
+        pillars_ordered_cm_.size());
       if (pillars_ordered_cm_.empty()) {
         phase_ = PickupPhase::LAND;
         current_idx_ = waypoints_.size();

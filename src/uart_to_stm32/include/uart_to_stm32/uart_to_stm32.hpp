@@ -41,9 +41,11 @@ private:
   void sendVelocityToSerial(const Eigen::Vector3d & transformed_velocity);
   void sendTargetVelocityToSerial(float vx_cm_per_s, float vy_cm_per_s, float vz_cm_per_s, float vyaw_deg_per_s);
   void sendAprilTagCodeToSerial(uint8_t apriltag_code);
+  void sendArmControlToSerial(uint8_t arm_state);
   void sendMissionCompleteToSerial();
   void publishDeliveryCommand();
   void visualAlignedAprilTagCodeCallback(const std_msgs::msg::UInt8::SharedPtr msg);
+  void armControlCallback(const std_msgs::msg::UInt8::SharedPtr msg);
   void missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr msg);
   void laserGroundHeightCallback(const std_msgs::msg::Int16::SharedPtr msg);
   void sendLaserGroundHeightToSerial(int16_t height_cm);
@@ -61,6 +63,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr route_choice_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr target_velocity_sub_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr visual_aligned_apriltag_code_sub_;
+  rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr arm_control_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr mission_complete_sub_;
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr laser_ground_height_sub_;
 
@@ -84,6 +87,7 @@ private:
   static constexpr uint8_t TARGET_VELOCITY_FRAME_ID = 0x31;
   static constexpr uint8_t ST_READY_QUERY_ID = 0xF1;
   static constexpr uint8_t APRILTAG_CODE_FRAME_ID = 0x11;
+  static constexpr uint8_t ARM_CONTROL_FRAME_ID = 0x33;
   static constexpr uint8_t MISSION_COMPLETE_FRAME_ID = 0x66;
   static constexpr uint8_t MISSION_COMPLETE_VALUE = 0x06;
   static constexpr uint8_t LASER_GROUND_HEIGHT_FRAME_ID = 0x07;  // 2B int16 little-endian, 单位 cm

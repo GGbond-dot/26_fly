@@ -9,7 +9,8 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     """demo3：在 demo2 的基础上，把扫描任务换成"抓取任务"(pillar_pickup_mission)，
     同时：
-      1) visual_node 发布方框几何中心到 /fine_data，供 PID 视觉接管使用；
+      1) visual_node 只用于屏幕显示识别效果，输出重映射到 /visual_debug/*
+         避免参与 PID 视觉微调；
       2) PID 的 /height 重映射到 /laser_array/ground_height，z 轴闭环始终用面阵
          激光（抗高台），避免下降到高台正上方时点阵读数突变导致失稳。
     本文件不改动 demo2 相关启动。
@@ -22,6 +23,7 @@ def generate_launch_description():
     activity_control_pkg_share= FindPackageShare(package='activity_control_pkg').find('activity_control_pkg')
     pillar_detector_pkg_share = FindPackageShare(package='pillar_detector_pkg').find('pillar_detector_pkg')
     laser_array_pkg_share     = FindPackageShare(package='laser_array_pkg').find('laser_array_pkg')
+    magnet_control_pkg_share  = FindPackageShare(package='magnet_control_pkg').find('magnet_control_pkg')
 
     fly_carto_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -52,7 +54,8 @@ def generate_launch_description():
         )
     )
 
-    # visual_node 直接起（覆盖 center_source=square），不走 visual_pkg.launch.py
+    # visual_node 直接起，只用于看摄像头识别效果；输出 remap 到 debug 话题，
+    # 避免 /fine_data 等控制话题影响 PID/抓取任务。
     visual_node = Node(
         package="visual_pkg",
         executable="visual_node",
@@ -64,16 +67,29 @@ def generate_launch_description():
             "height": 480,
             "camera_fps": 30,
             "process_fps": 15.0,
-            "show_display": False,
+            "show_display": True,
             "apriltag_code": -1,
             "center_source": "square",
         }],
+        remappings=[
+            ("/circle_center", "/visual_debug/circle_center"),
+            ("/circle_area_ratio", "/visual_debug/circle_area_ratio"),
+            ("/fine_data", "/visual_debug/fine_data"),
+            ("/apriltag_code", "/visual_debug/apriltag_code"),
+        ],
     )
 
     # 面阵激光地面高度（抗高台版）
     laser_array_ground_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(laser_array_pkg_share, 'launch', 'laser_array_ground.launch.py')
+        )
+    )
+
+    # 电磁铁控制（pillar_pickup_mission 通过 /magnet/cmd 吸/松）
+    magnet_control_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(magnet_control_pkg_share, 'launch', 'magnet_control.launch.py')
         )
     )
 
@@ -85,4 +101,5 @@ def generate_launch_description():
         pillar_detector_tf_launch,
         visual_node,
         laser_array_ground_launch,
+        magnet_control_launch,
     ])
