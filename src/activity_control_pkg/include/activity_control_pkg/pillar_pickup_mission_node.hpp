@@ -133,6 +133,16 @@ enum class PickupSub
   CLIMB_AFTER_DROP  // 爬回巡航高度
 };
 
+// 降落（对角起停区 B）的子状态：视觉对准 B 黑框中心后分段精准降落
+enum class LandSub
+{
+  APPROACH,    // 飞到 B 上方对准高度（粗定位）
+  CENTER,      // 视觉接管对准 B 黑框中心，对上后固化降落 anchor
+  DESCEND_MID, // 关接管，降 land_recenter_drop_cm 到中停高度（位置保持在 anchor）
+  RECENTER,    // 中停高度再视觉对准一次 B 框，更新 anchor（近一截、像素更准）
+  DESCEND      // 关接管，竖直降到地面（位置保持在 anchor）
+};
+
 class PillarPickupMissionNode : public rclcpp::Node
 {
 public:
@@ -170,6 +180,8 @@ private:
   void planPickupOrder();
   void enterPickupSub(PickupSub s);
   void stepPickup(double x_cm, double y_cm, double z_cm);
+  void enterLandSub(LandSub s);
+  void stepLanding(double x_cm, double y_cm, double z_cm);  // 视觉对准 B 框精准降落
   void buildDescendPlan(double pillar_height_cm, bool is_drop);  // 按柱高生成分段中停读数表
   void startGrabDescend();                         // 建表后进入下降（有中停→DESCEND_MID，否则直接 FINAL）
   void startDropDescend();                         // 放置侧复用分段下降/中停对准
@@ -216,6 +228,11 @@ private:
   double pillar_visit_height_cm_;
   double pillar_wait_timeout_sec_;
 
+  // 精准降落（视觉对准 B 黑框中心）
+  bool   land_visual_enable_;       // true=飞到 B 上方先视觉对准框中心再降；false=纯位置降落（旧行为）
+  double land_align_height_cm_;      // 对准 B 框时的悬停高度（要能看全 50cm 框）
+  double land_recenter_drop_cm_;     // 第一次对准后再下降此高度，到中停高度二次对准一次（默认60）
+
   // 视觉对准
   double visual_align1_timeout_sec_;
   double visual_align2_timeout_sec_;
@@ -254,11 +271,17 @@ private:
   double descend_abort_area_cm_; // 下降安全底线：面阵读数 < 此值(臂尖将到地面以下=不可能)立即中止下降爬回重试（默认22≈R-5）
   double descend_seg_len_min_plate_cm_; // 抓最小片时用更短分段（默认20），放置不加密
   double grab_press_cm_;      // 抓取下压量：z = R + 柱高 − grab_press（压住铁片确保吸牢）
-  double drop_gap_cm_;        // 放置余隙：z = R + 空柱高 + 已叠 + drop_gap（叠层顶上方轻放）
-  double drop_press_cm_;      // 放置下压量：z = R + 空柱高 + 已叠 + drop_gap − drop_press
+  double drop_gap_cm_;        // （放置已改"上方释放"，不再使用；保留避免参数报错）
+  double drop_press_cm_;      // （放置已改"上方释放"，不再使用；保留避免参数报错）
+  double drop_release_clearance_cm_;   // 放置末段不贴死：z = R + 空柱高 + 已叠 + 此余隙（叠面上方释放）
+  double drop_post_release_hover_sec_; // 放置松磁后原地悬停时长（防机体惯性带偏），取代旧 drop_settle 语义
   double grab_final_dy_cm_;   // 抓取末段盲降额外 y 偏置（放置不用）
+  double drop_final_dy_cm_;    // 放置末段额外 y 偏置：补电磁铁吸取点物理偏置，防铁片偏左滚落（与 grab 同向，map +y=画面左）
+  double drop_final_dx_cm_;    // 放置末段额外 x 偏置（map +x=画面正上方）：放置专用，正值往前补
+  // 抓取下降模式 A/B：segmented=分段中停二次对准；direct_after_center=对准中心后直接盲降到位（不分段）
+  std::string grab_descend_mode_;
   double arm_extend_sec_;     // 放置时机械臂伸直到位耗时
-  double drop_settle_sec_;    // 放置松磁后落稳等待
+  double drop_settle_sec_;    // （放置已改用 drop_post_release_hover_sec；保留避免参数报错）
   double hover_grab_sec_;
   double plate_thickness_cm_;        // 每片铁片厚度，用于叠放时逐层抬高落点
   bool   skip_largest_grab_visual_align_; // 最大铁片抓取不做视觉微调，避免过正导致气动抖动
@@ -306,6 +329,12 @@ private:
   bool   has_drop_anchor_ = false;
   double drop_anchor_x_cm_ = 0.0;
   double drop_anchor_y_cm_ = 0.0;
+
+  // 降落 anchor：视觉对准 B 框时机体就在框中心正上方，记其实际 map 位姿，竖直降到此处
+  LandSub land_sub_ = LandSub::APPROACH;
+  bool    has_land_anchor_ = false;
+  double  land_anchor_x_cm_ = 0.0;
+  double  land_anchor_y_cm_ = 0.0;
 
   // 第二趟
   std::vector<std::size_t> pickup_order_;      // 待抓铁片柱索引，按占比大→小

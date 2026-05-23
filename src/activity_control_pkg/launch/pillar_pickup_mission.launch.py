@@ -1,9 +1,26 @@
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
+    # 抓取下降模式 A/B：可在命令行用 grab_descend_mode:=direct_after_center 切换。
+    grab_descend_mode = LaunchConfiguration("grab_descend_mode")
+    # 放置末段 xy 偏置：可在命令行直接覆盖，如 drop_final_dy_cm:=-6.0 drop_final_dx_cm:=4.0
+    drop_final_dy_cm = LaunchConfiguration("drop_final_dy_cm")
+    drop_final_dx_cm = LaunchConfiguration("drop_final_dx_cm")
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "grab_descend_mode", default_value="segmented",
+            description="抓取下降模式：segmented(分段中停二次对准) / direct_after_center(对准+现场测高后直接盲降) / direct_no_remeasure(对准后跳过现场测高，直上直下抓取)"),
+        DeclareLaunchArgument(
+            "drop_final_dy_cm", default_value="-2.0",
+            description="放置末段 y 偏置(cm)，map +y=画面左；偏左滚落可加到 -6~-7"),
+        DeclareLaunchArgument(
+            "drop_final_dx_cm", default_value="4.0",
+            description="放置末段 x 偏置(cm)，map +x=画面正上方，正值往前补"),
         Node(
             package="activity_control_pkg",
             executable="pillar_pickup_mission",
@@ -27,6 +44,16 @@ def generate_launch_description():
                 "landing_y_cm": -250.0,
                 "pillar_visit_height_cm": 150.0,
                 "pillar_wait_timeout_sec": 3.0,
+
+                # 精准降落：飞到对角起停区 B 上方先用视觉对准 B 黑色方框中心，再竖直降落。
+                # land_visual_enable=False 则回退纯位置降落（旧行为）。
+                # land_align_height_cm 是对准 B 框时的悬停高度（要能看全 ~50cm 框；默认=巡航 150，
+                # 此高度 50cm 框居中、对角的 A 框在视野外，rect_center_bias 会优先锁正下方的 B）。
+                "land_visual_enable": True,
+                "land_align_height_cm": 150.0,
+                # 第一次对准后再下降 land_recenter_drop_cm 到中停高度，二次对准 B 框一次（更近、像素更准）再降到底。
+                # 默认 60：从 150 降到 90 再对一次。设 0 则不分段（对准一次后直接降到底）。
+                "land_recenter_drop_cm": 60.0,
 
                 # 视觉对准
                 "visual_align1_timeout_sec": 4.0,
@@ -101,14 +128,30 @@ def generate_launch_description():
                 # 5-23 分段下降版实飞：grab_press=0 时臂尖停在柱顶面上方约4cm够不到 → 设 4。
                 # 还吸不牢够不到→继续回调正值；反而下降过头压坏→回调（最小到 0 或设负值）。
                 "grab_press_cm": 4.0,
-                # 放置余隙(cm)：z=R+空柱高+已叠+drop_gap-drop_press。drop_gap 仍为 0。
+                # 抓取下降模式 A/B 实验开关：
+                #   "segmented"          = 当前方案：CENTER 对准一次 → 下降中每段 RECENTER_MID 再对准（默认）。
+                #   "direct_after_center"= CENTER 对准一次后直接盲降到抓取高度，下降途中不再视觉微调。
+                # 两种模式都【会先在 CENTER 微调一次】，区别只在下降途中是否继续分段对准。切换即做对比试飞。
+                # 命令行覆盖：... grab_descend_mode:=direct_after_center
+                "grab_descend_mode": grab_descend_mode,
+                # ↓ drop_gap_cm/drop_press_cm 已弃用（放置改"叠面上方释放"），保留仅避免参数报错。
                 "drop_gap_cm": 0.0,
-                # 放置下压量(cm)：值越大放置末段降得越低，确保铁片贴到叠面后再松磁。
                 "drop_press_cm": 2.0,
-                # 抓取末段盲降额外 y 偏置(cm)：只用于抓取 DESCEND_FINAL，放置不加。
+                # 放置末段不贴死：目标=叠面上方 drop_release_clearance(cm)。对准一次中心→直接降到此高度→
+                # 伸臂→松磁→悬停 drop_post_release_hover_sec→收臂。避免贴近接触摩擦/下压/惯性把片带歪。
+                "drop_release_clearance_cm": 10.0,
+                "drop_post_release_hover_sec": 1.0,
+                # 抓取末段盲降额外 y 偏置(cm)：只用于抓取 DESCEND_FINAL。
                 "grab_final_dy_cm": -2.0,
-                # 放置释放时序：先伸臂，等机械臂到位后松磁，再等铁片落稳后收臂。
+                # 放置末段额外 y 偏置(cm)：补电磁铁吸取点物理偏置，防铁片偏左(map+y)滚落。
+                # 与 grab 同向(负)。可命令行覆盖：drop_final_dy_cm:=-6.0
+                "drop_final_dy_cm": ParameterValue(drop_final_dy_cm, value_type=float),
+                # 放置末段额外 x 偏置(cm)：map +x=画面正上方，正值往前补。放置专用，抓取不加。
+                # 可命令行覆盖：drop_final_dx_cm:=4.0
+                "drop_final_dx_cm": ParameterValue(drop_final_dx_cm, value_type=float),
+                # 放置释放时序：先伸臂，等机械臂到位(arm_extend_sec)后松磁，再悬停(drop_post_release_hover_sec)收臂。
                 "arm_extend_sec": 1.2,
+                # ↓ drop_settle_sec 已弃用（放置改用 drop_post_release_hover_sec），保留仅避免参数报错。
                 "drop_settle_sec": 0.5,
                 # 抓取到位后悬停等待机械臂动作完成；放置侧现在用 arm_extend_sec + drop_settle_sec。
                 "hover_grab_sec": 1.0,

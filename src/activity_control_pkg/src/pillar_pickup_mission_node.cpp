@@ -54,6 +54,11 @@ PillarPickupMissionNode::PillarPickupMissionNode(const rclcpp::NodeOptions & opt
   pillar_visit_height_cm_  = declare_parameter("pillar_visit_height_cm", 150.0);
   pillar_wait_timeout_sec_ = declare_parameter("pillar_wait_timeout_sec", 3.0);
 
+  // 精准降落：飞到 B 上方先视觉对准 B 黑框中心再竖直降落。对准高度默认=巡航高度(已验证能看全框)。
+  land_visual_enable_      = declare_parameter("land_visual_enable",      true);
+  land_align_height_cm_    = declare_parameter("land_align_height_cm",    pillar_visit_height_cm_);
+  land_recenter_drop_cm_   = declare_parameter("land_recenter_drop_cm",   60.0);
+
   visual_align1_timeout_sec_  = declare_parameter("visual_align1_timeout_sec", 4.0);
   visual_align2_timeout_sec_  = declare_parameter("visual_align2_timeout_sec", 1.5);
   visual_pixel_tol_           = declare_parameter("visual_pixel_tol_px",      15);
@@ -86,11 +91,16 @@ PillarPickupMissionNode::PillarPickupMissionNode(const rclcpp::NodeOptions & opt
   descend_abort_area_cm_        = declare_parameter("descend_abort_area_cm",        22.0);
   descend_seg_len_min_plate_cm_ = declare_parameter("descend_seg_len_min_plate_cm", 20.0);
   grab_press_cm_      = declare_parameter("grab_press_cm",       2.5);  // 抓取下压量(2~3cm)
-  drop_gap_cm_        = declare_parameter("drop_gap_cm",         2.0);  // 放置余隙
-  drop_press_cm_      = declare_parameter("drop_press_cm",       2.0);  // 放置下压量
+  drop_gap_cm_        = declare_parameter("drop_gap_cm",         2.0);  // 已弃用(放置改上方释放)
+  drop_press_cm_      = declare_parameter("drop_press_cm",       2.0);  // 已弃用(放置改上方释放)
+  drop_release_clearance_cm_   = declare_parameter("drop_release_clearance_cm",   10.0); // 放置叠面上方释放余隙
+  drop_post_release_hover_sec_ = declare_parameter("drop_post_release_hover_sec",  1.0); // 放置松磁后悬停
   grab_final_dy_cm_   = declare_parameter("grab_final_dy_cm",   -2.0);  // 抓取末段 y 偏置
+  drop_final_dy_cm_   = declare_parameter("drop_final_dy_cm",   -2.0);  // 放置末段 y 偏置（补吸取点偏置，防偏左滚落；偏左明显可加到 -6~-7）
+  drop_final_dx_cm_   = declare_parameter("drop_final_dx_cm",    4.0);  // 放置末段 x 偏置（map +x=画面正上方，正值往前补）
+  grab_descend_mode_  = declare_parameter("grab_descend_mode", std::string("segmented")); // segmented / direct_after_center / direct_no_remeasure
   arm_extend_sec_     = declare_parameter("arm_extend_sec",      1.2);  // 放置伸臂到位耗时
-  drop_settle_sec_    = declare_parameter("drop_settle_sec",     0.5);  // 松磁后落稳等待
+  drop_settle_sec_    = declare_parameter("drop_settle_sec",     0.5);  // 已弃用(放置改用 drop_post_release_hover_sec)
   hover_grab_sec_     = declare_parameter("hover_grab_sec",      2.0);
   plate_thickness_cm_ = declare_parameter("plate_thickness_cm",  1.0);
   skip_largest_grab_visual_align_ = declare_parameter("skip_largest_grab_visual_align", true);
@@ -597,6 +607,18 @@ std::size_t PillarPickupMissionNode::nearestToLanding() const
 void PillarPickupMissionNode::startLanding()
 {
   phase_ = MissionPhase::LAND;
+  has_land_anchor_ = false;
+
+  if (land_visual_enable_) {
+    // 精准降落：飞到 B 上方 → 视觉对准 B 黑框中心 → 竖直降落（见 enterLandSub/stepLanding）。
+    RCLCPP_INFO(get_logger(),
+      "进入精准降落，先飞到对角起停区 B (%.0f, %.0f) 上方视觉对准黑框",
+      landing_x_cm_, landing_y_cm_);
+    enterLandSub(LandSub::APPROACH);
+    return;
+  }
+
+  // 纯位置降落（旧行为，land_visual_enable=false 时）
   publishVisualTakeover(false);
   republish_enabled_ = true;
   current_idx_ = waypoints_.size();
@@ -605,6 +627,137 @@ void PillarPickupMissionNode::startLanding()
   waypoints_.push_back(PickupWaypoint{landing_x_cm_, landing_y_cm_, land_height_cm_,         0.0, 0.0, "land"});
   publishTarget(waypoints_[current_idx_]);
   RCLCPP_INFO(get_logger(), "进入降落阶段，目标对角起停区 (%.0f, %.0f)", landing_x_cm_, landing_y_cm_);
+}
+
+// 降落子状态进入：设目标点 + 视觉接管开关
+void PillarPickupMissionNode::enterLandSub(LandSub s)
+{
+  land_sub_ = s;
+  sub_enter_time_ = now();
+  fine_hist_.clear();
+
+  // 对准成功后用 anchor（机体实际位姿）；否则回退名义降落点 B。
+  const double ax = has_land_anchor_ ? land_anchor_x_cm_ : landing_x_cm_;
+  const double ay = has_land_anchor_ ? land_anchor_y_cm_ : landing_y_cm_;
+
+  switch (s) {
+    case LandSub::APPROACH: {
+      sub_target_ = PickupWaypoint{landing_x_cm_, landing_y_cm_, land_align_height_cm_, 0.0, 0.0, "land_approach"};
+      republish_enabled_ = true;
+      publishVisualTakeover(false);
+      publishTarget(sub_target_);
+      break;
+    }
+    case LandSub::CENTER: {
+      sub_target_ = PickupWaypoint{landing_x_cm_, landing_y_cm_, land_align_height_cm_, 0.0, 0.0, "land_center"};
+      publishTarget(sub_target_);
+      republish_enabled_ = false;          // 视觉接管期间不重发位置目标
+      publishVisualTakeover(true);         // 对准 B 黑框中心
+      break;
+    }
+    case LandSub::DESCEND_MID: {
+      publishVisualTakeover(false);
+      const double mid_z = std::max(land_height_cm_, land_align_height_cm_ - land_recenter_drop_cm_);
+      sub_target_ = PickupWaypoint{ax, ay, mid_z, 0.0, 0.0, "land_descend_mid"};
+      republish_enabled_ = true;           // 位置保持在 anchor 正上方，下降到中停高度
+      publishTarget(sub_target_);
+      break;
+    }
+    case LandSub::RECENTER: {
+      const double mid_z = std::max(land_height_cm_, land_align_height_cm_ - land_recenter_drop_cm_);
+      sub_target_ = PickupWaypoint{ax, ay, mid_z, 0.0, 0.0, "land_recenter"};
+      publishTarget(sub_target_);
+      republish_enabled_ = false;          // 视觉接管期间不重发位置目标
+      publishVisualTakeover(true);         // 中停高度再对准一次 B 框
+      break;
+    }
+    case LandSub::DESCEND: {
+      publishVisualTakeover(false);
+      sub_target_ = PickupWaypoint{ax, ay, land_height_cm_, 0.0, 0.0, "land_descend"};
+      republish_enabled_ = true;           // 全程位置保持在 anchor 正上方竖直下降
+      publishTarget(sub_target_);
+      break;
+    }
+  }
+  RCLCPP_INFO(get_logger(), "[降落] 进入子阶段 %d，目标=(%.1f,%.1f,%.1f)",
+    static_cast<int>(s), sub_target_.x_cm, sub_target_.y_cm, sub_target_.z_cm);
+}
+
+void PillarPickupMissionNode::stepLanding(double x_cm, double y_cm, double z_cm)
+{
+  switch (land_sub_) {
+    case LandSub::APPROACH:
+      if (isReached(sub_target_, x_cm, y_cm, z_cm, 0.0)) {
+        enterLandSub(LandSub::CENTER);
+      }
+      break;
+    case LandSub::CENTER: {
+      const bool aligned = isVisuallyAligned();
+      const bool timeout = (now() - sub_enter_time_).seconds() > visual_align1_timeout_sec_;
+      if (aligned || timeout) {
+        if (aligned) {
+          // 视觉对上时机体就在 B 框中心正上方，记其实际位姿为降落 anchor。
+          land_anchor_x_cm_ = x_cm;
+          land_anchor_y_cm_ = y_cm;
+          has_land_anchor_ = true;
+          RCLCPP_INFO(get_logger(),
+            "[降落] 一次对准 B 框中心 -> anchor=(%.1f,%.1f)，相对名义降落点偏 %.1fcm",
+            x_cm, y_cm, std::hypot(x_cm - landing_x_cm_, y_cm - landing_y_cm_));
+        } else {
+          RCLCPP_WARN(get_logger(),
+            "[降落] 一次对准 B 框超时(%.1fs)，回退名义降落点 (%.1f,%.1f)",
+            visual_align1_timeout_sec_, landing_x_cm_, landing_y_cm_);
+        }
+        // 下降一段后再对齐一次：land_recenter_drop>0 且中停高度还在地面之上才分段，否则直接降到底。
+        const double mid_z = land_align_height_cm_ - land_recenter_drop_cm_;
+        if (land_recenter_drop_cm_ > 0.0 && mid_z > land_height_cm_) {
+          enterLandSub(LandSub::DESCEND_MID);
+        } else {
+          enterLandSub(LandSub::DESCEND);
+        }
+      }
+      break;
+    }
+    case LandSub::DESCEND_MID:
+      if (isReached(sub_target_, x_cm, y_cm, z_cm, 0.0)) {
+        enterLandSub(LandSub::RECENTER);   // 到中停高度再视觉对准一次
+      }
+      break;
+    case LandSub::RECENTER: {
+      const bool aligned = isVisuallyAligned();
+      const bool timeout = (now() - sub_enter_time_).seconds() > visual_align2_timeout_sec_;
+      if (aligned || timeout) {
+        if (aligned) {
+          // 中停高度更近、像素更准，刷新 anchor。
+          land_anchor_x_cm_ = x_cm;
+          land_anchor_y_cm_ = y_cm;
+          has_land_anchor_ = true;
+          RCLCPP_INFO(get_logger(),
+            "[降落] 二次对准 B 框中心 -> anchor=(%.1f,%.1f)，相对名义降落点偏 %.1fcm",
+            x_cm, y_cm, std::hypot(x_cm - landing_x_cm_, y_cm - landing_y_cm_));
+        } else {
+          RCLCPP_WARN(get_logger(),
+            "[降落] 二次对准 B 框超时(%.1fs)，沿用上次 anchor (%.1f,%.1f)",
+            visual_align2_timeout_sec_, land_anchor_x_cm_, land_anchor_y_cm_);
+        }
+        enterLandSub(LandSub::DESCEND);
+      }
+      break;
+    }
+    case LandSub::DESCEND:
+      if (isReached(sub_target_, x_cm, y_cm, z_cm, 0.0)) {
+        publishVisualTakeover(false);
+        phase_ = MissionPhase::DONE;
+        if (!mission_complete_sent_) {
+          std_msgs::msg::Empty e;
+          mission_complete_pub_->publish(e);
+          mission_complete_sent_ = true;
+        }
+        publishActiveController(3);
+        RCLCPP_INFO(get_logger(), "精准降落完成，任务结束。");
+      }
+      break;
+  }
 }
 
 // ─────────── WAIT_PILLARS ───────────
@@ -902,8 +1055,9 @@ void PillarPickupMissionNode::buildDescendPlan(double pillar_height_cm, bool is_
   descend_checkpoints_.clear();
   descend_ckpt_idx_ = 0;
 
+  // 放置已改"叠面上方 drop_release_clearance 释放"（不贴死、不再 −drop_press）。
   const double target_reading = is_drop
-    ? (ARM_GROUND_AREA_CM + pillar_height_cm + stack_count_ * plate_thickness_cm_ + drop_gap_cm_ - drop_press_cm_)
+    ? (ARM_GROUND_AREA_CM + pillar_height_cm + stack_count_ * plate_thickness_cm_ + drop_release_clearance_cm_)
     : (ARM_GROUND_AREA_CM + pillar_height_cm - grab_press_cm_);
   double cur = pillar_visit_height_cm_;
   double remaining = cur - target_reading;
@@ -912,15 +1066,20 @@ void PillarPickupMissionNode::buildDescendPlan(double pillar_height_cm, bool is_
   const double seg = std::max(1.0, seg_base);
   const double tail = std::max(0.0, descend_min_tail_cm_);
 
-  while (remaining >= seg + tail) {
+  // 抓取 A/B：direct_after_center / direct_no_remeasure 模式都不生成中停点 → 对准中心后直接盲降到位（不分段二次对准）。
+  const bool direct_grab = !is_drop &&
+    (grab_descend_mode_ == "direct_after_center" || grab_descend_mode_ == "direct_no_remeasure");
+
+  while (!direct_grab && remaining >= seg + tail) {
     cur -= seg;
     descend_checkpoints_.push_back(cur);
     remaining -= seg;
   }
 
   RCLCPP_INFO(get_logger(),
-    "[铁片 %zu/%zu] %s分段下降：柱高=%.1f target=%.1f D=%.1fcm seg=%.1f → %zu 个中停点，末段盲降%.1fcm",
+    "[铁片 %zu/%zu] %s下降[%s]：柱高=%.1f target=%.1f D=%.1fcm seg=%.1f → %zu 个中停点，末段盲降%.1fcm",
     pickup_iter_ + 1, pickup_order_.size(), is_drop ? "放置" : "抓取",
+    is_drop ? "drop" : grab_descend_mode_.c_str(),
     pillar_height_cm, target_reading, (pillar_visit_height_cm_ - target_reading),
     seg, descend_checkpoints_.size(), remaining);
 }
@@ -942,13 +1101,12 @@ void PillarPickupMissionNode::startGrabDescend()
 
 void PillarPickupMissionNode::startDropDescend()
 {
+  // 放置：CENTER_DROP 已对准空柱中心并固化 anchor，这里【对准一次后直接下降到叠面上方
+  // drop_release_clearance】——不再分段反复追目标（叠片后近距视觉易被已放铁片干扰）。
   descend_is_drop_ = true;
-  buildDescendPlan(empty_pillar_height_cm_, true);
-  if (descend_checkpoints_.empty()) {
-    enterPickupSub(PickupSub::DESCEND_FINAL);
-  } else {
-    enterPickupSub(PickupSub::DESCEND_MID);
-  }
+  descend_checkpoints_.clear();
+  descend_ckpt_idx_ = 0;
+  enterPickupSub(PickupSub::DESCEND_FINAL);
 }
 
 void PillarPickupMissionNode::enterPickupSub(PickupSub s)
@@ -1044,16 +1202,20 @@ void PillarPickupMissionNode::enterPickupSub(PickupSub s)
         publishMagnet(true);   // 确保磁吸保持（无中停的短下降直接进此段时也已通电）
       }
       const double target_height = descend_is_drop_ ? empty_pillar_height_cm_ : ph;
+      // 放置末段=叠面上方 drop_release_clearance（不贴死再松磁）；抓取末段=R+柱高−grab_press。
       const double z_final = descend_is_drop_
-        ? (ARM_GROUND_AREA_CM + target_height + stack_count_ * plate_thickness_cm_ + drop_gap_cm_ - drop_press_cm_)
+        ? (ARM_GROUND_AREA_CM + target_height + stack_count_ * plate_thickness_cm_ + drop_release_clearance_cm_)
         : (ARM_GROUND_AREA_CM + target_height - grab_press_cm_);
       double tx = px, ty = py;
       if (descend_is_drop_) {
         getDropTargetXY(tx, ty);
       }
       applyArmOffsetToTarget(tx, ty, 0.0);
-      if (!descend_is_drop_) {
-        ty += grab_final_dy_cm_;
+      // 抓取/放置末段都叠加 y 偏置补电磁铁吸取点物理偏置：抓取用 grab_final_dy，放置用 drop_final_dy
+      // （放置侧 5-23-16-16 实飞铁片偏 map+y=画面左滚落，故放置也补同向负偏置）
+      ty += descend_is_drop_ ? drop_final_dy_cm_ : grab_final_dy_cm_;
+      if (descend_is_drop_) {
+        tx += drop_final_dx_cm_;   // 放置专用 x 偏置（map +x=画面正上方）；抓取不加
       }
       sub_target_ = PickupWaypoint{tx, ty, z_final, 0.0, 0.0,
         descend_is_drop_ ? "drop_descend_final" : "descend_final"};
@@ -1132,8 +1294,9 @@ void PillarPickupMissionNode::enterPickupSub(PickupSub s)
       drop_released_ = false;
       republish_enabled_ = false;
       RCLCPP_INFO(get_logger(),
-        "[铁片 %zu/%zu] HOVER_DROP: 先伸臂 %.1fs → 松磁 → 落稳 %.1fs（已叠 %d 层）",
-        pickup_iter_ + 1, pickup_order_.size(), arm_extend_sec_, drop_settle_sec_, stack_count_);
+        "[铁片 %zu/%zu] HOVER_DROP: 叠面上方%.1fcm → 伸臂 %.1fs → 松磁 → 悬停 %.1fs（已叠 %d 层）",
+        pickup_iter_ + 1, pickup_order_.size(), drop_release_clearance_cm_,
+        arm_extend_sec_, drop_post_release_hover_sec_, stack_count_);
       publishServo(true);
       break;
     }
@@ -1181,7 +1344,9 @@ void PillarPickupMissionNode::stepPickup(double x_cm, double y_cm, double z_cm)
       pickup_attempts_, pickup_max_attempts_);
     carrying_plate_ = false;
     if (pickup_attempts_ < pickup_max_attempts_) {
-      enterPickupSub(PickupSub::MEASURE_HEIGHT_GRAB);   // 爬回重测再试
+      // direct_no_remeasure 不测高 → 回 CENTER 重新对准再直上直下；其余模式回测高态重测
+      enterPickupSub(grab_descend_mode_ == "direct_no_remeasure"
+                       ? PickupSub::CENTER : PickupSub::MEASURE_HEIGHT_GRAB);
     } else {
       // 本片用尽：松磁收臂，发 /pickup_failed，跳下一片；全部片用尽才降落（与 OBSERVE_GRAB 失败收尾一致）
       RCLCPP_ERROR(get_logger(),
@@ -1214,10 +1379,20 @@ void PillarPickupMissionNode::stepPickup(double x_cm, double y_cm, double z_cm)
       if (shouldSkipGrabVisual() ||
           isVisuallyAligned() ||
           (now() - sub_enter_time_).seconds() > visual_align1_timeout_sec_) {
-        RCLCPP_INFO(get_logger(),
-          "[铁片 %zu/%zu] 对准完成，进入抓取前现场测高",
-          pickup_iter_ + 1, pickup_order_.size());
-        enterPickupSub(PickupSub::MEASURE_HEIGHT_GRAB);
+        if (grab_descend_mode_ == "direct_no_remeasure") {
+          // 直上直下模式：对齐后不做现场测高（不移到点阵柱心、不重测），
+          // 直接用第一趟 survey 柱高从当前对准位竖直下降抓取。
+          has_pickup_live_height_ = false;
+          RCLCPP_INFO(get_logger(),
+            "[铁片 %zu/%zu] 对准完成[direct_no_remeasure]，跳过现场测高，直上直下抓取",
+            pickup_iter_ + 1, pickup_order_.size());
+          startGrabDescend();
+        } else {
+          RCLCPP_INFO(get_logger(),
+            "[铁片 %zu/%zu] 对准完成，进入抓取前现场测高",
+            pickup_iter_ + 1, pickup_order_.size());
+          enterPickupSub(PickupSub::MEASURE_HEIGHT_GRAB);
+        }
       }
       break;
     case PickupSub::MEASURE_HEIGHT_GRAB: {
@@ -1322,7 +1497,8 @@ void PillarPickupMissionNode::stepPickup(double x_cm, double y_cm, double z_cm)
         RCLCPP_WARN(get_logger(),
           "[铁片 %zu/%zu] 抓取失败（尝试 %d/%d），重新下降再试",
           pickup_iter_ + 1, pickup_order_.size(), pickup_attempts_, pickup_max_attempts_);
-        enterPickupSub(PickupSub::MEASURE_HEIGHT_GRAB);
+        enterPickupSub(grab_descend_mode_ == "direct_no_remeasure"
+                         ? PickupSub::CENTER : PickupSub::MEASURE_HEIGHT_GRAB);
       } else {
         // 本片 3 次都失败：松磁收臂，发 /pickup_failed，然后【跳下一片】，
         // 不直接降落。所有片各自试满 pickup_max_attempts 次仍失败，才进降落。
@@ -1388,7 +1564,7 @@ void PillarPickupMissionNode::stepPickup(double x_cm, double y_cm, double z_cm)
         RCLCPP_INFO(get_logger(),
           "[铁片 %zu/%zu] 放置伸臂到位，松磁释放", pickup_iter_ + 1, pickup_order_.size());
       }
-      if (elapsed >= arm_extend_sec_ + drop_settle_sec_) {
+      if (elapsed >= arm_extend_sec_ + drop_post_release_hover_sec_) {
         publishServo(false);
         carrying_plate_ = false;
         ++stack_count_;   // 这一片已叠上
@@ -1438,8 +1614,14 @@ void PillarPickupMissionNode::monitorTimerCallback()
       stepPickup(x_cm, y_cm, z_cm);
       break;
     case MissionPhase::SCAN:
-    case MissionPhase::LAND:
       stepWaypoints(x_cm, y_cm, z_cm, yaw_deg);
+      break;
+    case MissionPhase::LAND:
+      if (land_visual_enable_) {
+        stepLanding(x_cm, y_cm, z_cm);          // 视觉对准 B 框精准降落
+      } else {
+        stepWaypoints(x_cm, y_cm, z_cm, yaw_deg);  // 纯位置降落（旧行为）
+      }
       break;
     default:
       break;

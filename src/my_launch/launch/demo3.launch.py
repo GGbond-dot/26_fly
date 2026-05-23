@@ -16,6 +16,9 @@ def generate_launch_description():
     本文件不改动 demo2 相关启动。
     """
     show_display = LaunchConfiguration("show_display")
+    grab_descend_mode = LaunchConfiguration("grab_descend_mode")
+    drop_final_dy_cm = LaunchConfiguration("drop_final_dy_cm")
+    drop_final_dx_cm = LaunchConfiguration("drop_final_dx_cm")
 
     # 包路径
     my_carto_pkg_share        = FindPackageShare(package='my_carto_pkg').find('my_carto_pkg')
@@ -44,11 +47,16 @@ def generate_launch_description():
         )
     )
 
-    # demo3 专用：抓取任务节点
+    # demo3 专用：抓取任务节点。把抓取下降模式透传下去，可在命令行 grab_descend_mode:=... 切换。
     pillar_pickup_mission_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(activity_control_pkg_share, 'launch', 'pillar_pickup_mission.launch.py')
-        )
+        ),
+        launch_arguments={
+            "grab_descend_mode": grab_descend_mode,
+            "drop_final_dy_cm": drop_final_dy_cm,
+            "drop_final_dx_cm": drop_final_dx_cm,
+        }.items()
     )
     pillar_detector_tf_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -86,6 +94,15 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument("show_display", default_value="false"),
+        DeclareLaunchArgument(
+            "grab_descend_mode", default_value="segmented",
+            description="抓取下降模式 A/B：segmented(默认,分段中停二次对准) / direct_after_center(对准+现场测高后直接盲降) / direct_no_remeasure(对准后跳过现场测高,直上直下)"),
+        DeclareLaunchArgument(
+            "drop_final_dy_cm", default_value="-2.0",
+            description="放置末段 y 偏置(cm)，map +y=画面左；偏左滚落可加到 -6~-7"),
+        DeclareLaunchArgument(
+            "drop_final_dx_cm", default_value="4.0",
+            description="放置末段 x 偏置(cm)，map +x=画面正上方，正值往前补"),
         fly_carto_launch,
         uart_to_stm32_launch,
         position_pid_controller_launch,
