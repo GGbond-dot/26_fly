@@ -37,6 +37,8 @@ class VisualNode(Node):
         self.declare_parameter("apriltag_code", -1)
         # center_source: "circle" (默认，兼容 demo2) | "square" (demo3 抓取对准用方框几何中心)
         self.declare_parameter("center_source", "circle")
+        # 方框“中心框优先”指数：越大越偏向画面正中的框，压掉边角的 A/B 起停区方框。0=关闭(纯面积)。
+        self.declare_parameter("rect_center_bias", 2.0)
 
         cam_idx = int(self.get_parameter("camera_index").value)
         width = int(self.get_parameter("width").value)
@@ -48,6 +50,7 @@ class VisualNode(Node):
         self._center_source = "square" if src == "square" else "circle"
 
         self._config = DetectorConfig()
+        self._config.rect_center_bias = float(self.get_parameter("rect_center_bias").value)
         self._tracker = StableRectangleTracker(
             pred_decay=self._config.track_pred_decay,
             pred_max_step_ratio=self._config.track_pred_max_step_ratio,
@@ -163,7 +166,7 @@ class VisualNode(Node):
             and state.stable_hits >= max(2, self._tracker.required_hits)
         )
         if state.polygon is not None and (confirmed or allow_hold):
-            circle_current = detect_circle_in_square(binary_fused, state.polygon, self._config)
+            circle_current = detect_circle_in_square(binary_black, state.polygon, self._config)
 
         if circle_current is not None:
             smooth_ratio = self._ratio_filter.update(
@@ -175,12 +178,11 @@ class VisualNode(Node):
                 self._circle_misses = 0
         else:
             self._circle_misses += 1
-            if self._circle_misses > self._config.circle_hold_frames:
-                self._circle_last = None
-                self._ratio_filter.reset()
+            self._circle_last = None
+            self._ratio_filter.reset()
 
-        circle_for_pub = circle_current if circle_current is not None else self._circle_last
-        circle_hold = circle_current is None and self._circle_last is not None
+        circle_for_pub = circle_current
+        circle_hold = False
 
         now = self.get_clock().now().to_msg()
         frame_h, frame_w = frame.shape[:2]

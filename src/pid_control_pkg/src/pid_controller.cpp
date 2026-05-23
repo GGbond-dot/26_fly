@@ -308,8 +308,11 @@ std_msgs::msg::Float32MultiArray PositionPIDController::processPID(double dt)
   if (visual_takeover_active_) {
     const rclcpp::Time now_time = now();
     if (hasFreshVisualData(now_time)) {
-      vel_x_cm = pid_visual_x_.calculate(0.0, -visual_error_x_px_, dt);
-      vel_y_cm = pid_visual_y_.calculate(0.0, -visual_error_y_px_, dt);
+      // Camera/image axes to map axes (yaw is kept near 0):
+      // image +dy (target below center) means target is map -x, so move map -x;
+      // image +dx (target right of center) means target is map -y, so move map -y.
+      vel_x_cm = pid_visual_x_.calculate(0.0, visual_error_y_px_, dt);
+      vel_y_cm = pid_visual_y_.calculate(0.0, visual_error_x_px_, dt);
     } else {
       vel_x_cm = 0.0;
       vel_y_cm = 0.0;

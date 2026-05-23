@@ -33,11 +33,17 @@ class DetectorConfig:
     black_kernel_size: int = 5
     fused_close_kernel_size: int = 5
 
+    # 方框打分的“画面中心优先”指数：候选框中心离画面中心越近分越高。
+    # score *= center_score**rect_center_bias，center_score=1(正中)→0(画面角)。
+    # 0=关闭(纯按面积，旧行为)；越大越偏向画面正中的框。用于压掉边角挤进来的
+    # 起停区 A/B 方框(50cm 比柱顶框大、纯面积会抢锁)。默认 2.0。
+    rect_center_bias: float = 2.0
+
     # Circle detection and robustness parameters.
     circle_min_area: float = 140.0
-    circle_circularity_min: float = 0.60
-    circle_solidity_min: float = 0.70
-    circle_aspect_max: float = 1.7
+    circle_circularity_min: float = 0.50
+    circle_solidity_min: float = 0.82
+    circle_aspect_max: float = 1.6
     circle_roi_margin: int = 5
     circle_roi_erode_kernel: int = 5
     circle_center_offset_max_ratio: float = 0.32
@@ -45,10 +51,10 @@ class DetectorConfig:
     circle_repair_close_kernel: int = 9
 
     # Relaxed fallback for broken circles caused by reflection.
-    circle_relaxed_min_area: float = 70.0
-    circle_relaxed_circularity_min: float = 0.34
-    circle_relaxed_solidity_min: float = 0.38
-    circle_relaxed_aspect_max: float = 2.2
+    circle_relaxed_min_area: float = 120.0
+    circle_relaxed_circularity_min: float = 0.42
+    circle_relaxed_solidity_min: float = 0.78
+    circle_relaxed_aspect_max: float = 1.8
     circle_relaxed_center_offset_max_ratio: float = 0.55
     circle_relaxed_confidence_min: float = 0.14
 
@@ -438,6 +444,12 @@ def detect_black_rectangle_border(binary: np.ndarray, config: DetectorConfig) ->
     hierarchy = hierarchy[0]
     best: Optional[dict[str, Any]] = None
 
+    # 画面中心 + 半对角线长，用于“中心框优先”打分（压掉边角的 A/B 起停区方框）。
+    img_h, img_w = binary.shape[:2]
+    img_cx = img_w * 0.5
+    img_cy = img_h * 0.5
+    half_diag = max(1.0, float(np.hypot(img_cx, img_cy)))
+
     for i, contour in enumerate(contours):
         area = cv2.contourArea(contour)
         if area < config.min_area:
@@ -488,6 +500,15 @@ def detect_black_rectangle_border(binary: np.ndarray, config: DetectorConfig) ->
         angle_score = max(0.0, 1.0 - (sum(abs(a - 90.0) for a in right_angles) / (4.0 * config.angle_tolerance * 2.0)))
         border_bonus = 1.0 + min(0.4, hole_ratio)
         score = area * (0.55 + 0.45 * square_bias) * (0.7 + 0.3 * angle_score) * border_bonus
+
+        # 中心框优先：离画面中心越近分越高，压掉挤进画面边角的 A/B 起停区大方框。
+        if config.rect_center_bias > 0.0:
+            rect_cx = x + w * 0.5
+            rect_cy = y + h * 0.5
+            center_dist = float(np.hypot(rect_cx - img_cx, rect_cy - img_cy))
+            center_score = max(0.0, 1.0 - center_dist / half_diag)
+            score *= center_score ** config.rect_center_bias
+
         candidate = {
             "contour": contour,
             "polygon": points,
@@ -543,6 +564,11 @@ def contour_touches_boundary(contour: np.ndarray, safe_mask: np.ndarray) -> bool
 
 
 def detect_circle_in_square(binary: np.ndarray, polygon: np.ndarray, config: DetectorConfig) -> Optional[dict[str, Any]]:
+    """Detect a solid black disk inside the square border.
+
+    The input mask must be the HSV black mask. Fused/adaptive masks include border
+    edges and shadows, which can inflate empty pillars into false circle detections.
+    """
     ratio_square_mask, ratio_square_area = build_inner_square_mask(
         binary.shape,
         polygon,
@@ -572,16 +598,20 @@ def detect_circle_in_square(binary: np.ndarray, polygon: np.ndarray, config: Det
     square_center = np.mean(square_points, axis=0)
     sq_x, sq_y, sq_w, sq_h = cv2.boundingRect(square_points.astype(np.int32))
     max_center_offset = max(sq_w, sq_h) * config.circle_center_offset_max_ratio
+    relaxed_max_center = max(sq_w, sq_h) * config.circle_relaxed_center_offset_max_ratio
 
-    strict_best: Optional[dict[str, Any]] = None
-    relaxed_best: Optional[dict[str, Any]] = None
+    best: Optional[dict[str, Any]] = None
+    min_solid_area = max(float(config.circle_min_area), ratio_square_area * 0.015)
+    relaxed_min_solid_area = max(float(config.circle_relaxed_min_area), ratio_square_area * 0.012)
 
     for contour in contours:
         area = float(cv2.contourArea(contour))
-        if area > ratio_square_area * 0.82:
+        if area < relaxed_min_solid_area:
             continue
-
-        touches_boundary = contour_touches_boundary(contour, safe_mask)
+        # A real 11 cm disk can occupy most of the inner white square; only reject
+        # impossible full-mask blobs. Do not inflate area from minEnclosingCircle.
+        if area > ratio_square_area * 0.98:
+            continue
 
         perimeter = cv2.arcLength(contour, True)
         if perimeter <= 1e-6:
@@ -604,81 +634,63 @@ def detect_circle_in_square(binary: np.ndarray, polygon: np.ndarray, config: Det
             continue
 
         center_offset = float(np.hypot(cx - square_center[0], cy - square_center[1]))
+        ratio = float(area / ratio_square_area)
+        touches_boundary = contour_touches_boundary(contour, safe_mask)
 
-        # Adaptive effective area reduces under-estimation when contour is broken by reflection.
-        estimated_circle_area = float(np.pi * radius * radius)
-        quality = 0.55 * min(1.0, circularity) + 0.45 * min(1.0, solidity)
-        area_coeff = max(0.80, min(0.95, 0.95 - 0.15 * quality))
-        effective_area = max(area, area_coeff * estimated_circle_area)
-        if effective_area > ratio_square_area * 0.88:
-            continue
-
-        ratio = float(effective_area / ratio_square_area)
-
-        # Strict pass: preferred when the contour is complete.
-        if (
-            effective_area >= config.circle_min_area
+        strict = (
+            area >= min_solid_area
             and circularity >= config.circle_circularity_min
             and solidity >= config.circle_solidity_min
             and aspect <= config.circle_aspect_max
             and center_offset <= max_center_offset
-            and not touches_boundary
-        ):
-            aspect_score = max(0.0, 1.0 - abs(aspect - 1.0) / max(0.05, config.circle_aspect_max - 1.0))
-            center_score = max(0.0, 1.0 - (center_offset / max(1.0, max_center_offset)))
-            confidence = 0.42 * circularity + 0.32 * solidity + 0.16 * aspect_score + 0.10 * center_score
-            score = effective_area * confidence
-            candidate = {
-                "center": (int(cx), int(cy)),
-                "radius": float(radius),
-                "circle_area": effective_area,
-                "square_area": float(ratio_square_area),
-                "ratio": ratio,
-                "circularity": circularity,
-                "solidity": solidity,
-                "aspect": aspect,
-                "confidence": confidence,
-                "score": score,
-                "mode": "strict",
-            }
-            if strict_best is None or score > strict_best["score"]:
-                strict_best = candidate
-            continue
-
-        # Relaxed fallback: allows broken circles in clean competition scene.
-        relaxed_max_center = max(sq_w, sq_h) * config.circle_relaxed_center_offset_max_ratio
-        if (
-            effective_area >= config.circle_relaxed_min_area
+        )
+        relaxed = (
+            area >= relaxed_min_solid_area
             and circularity >= config.circle_relaxed_circularity_min
             and solidity >= config.circle_relaxed_solidity_min
             and aspect <= config.circle_relaxed_aspect_max
             and center_offset <= relaxed_max_center
-            and not touches_boundary
-        ):
-            aspect_score = max(0.0, 1.0 - abs(aspect - 1.0) / max(0.05, config.circle_relaxed_aspect_max - 1.0))
-            center_score = max(0.0, 1.0 - (center_offset / max(1.0, relaxed_max_center)))
-            confidence = 0.35 * circularity + 0.30 * solidity + 0.20 * aspect_score + 0.15 * center_score
-            if confidence < config.circle_relaxed_confidence_min:
-                continue
-            score = effective_area * confidence
-            candidate = {
-                "center": (int(cx), int(cy)),
-                "radius": float(radius),
-                "circle_area": effective_area,
-                "square_area": float(ratio_square_area),
-                "ratio": ratio,
-                "circularity": circularity,
-                "solidity": solidity,
-                "aspect": aspect,
-                "confidence": confidence,
-                "score": score,
-                "mode": "relaxed",
-            }
-            if relaxed_best is None or score > relaxed_best["score"]:
-                relaxed_best = candidate
+        )
+        if not strict and not relaxed:
+            continue
 
-    return strict_best if strict_best is not None else relaxed_best
+        # Small fragments touching the eroded ROI boundary are usually black border
+        # residue. Large disks may naturally approach the border, so keep them.
+        if touches_boundary and ratio < 0.35:
+            continue
 
+        aspect_limit = config.circle_aspect_max if strict else config.circle_relaxed_aspect_max
+        center_limit = max_center_offset if strict else relaxed_max_center
+        aspect_score = max(0.0, 1.0 - abs(aspect - 1.0) / max(0.05, aspect_limit - 1.0))
+        center_score = max(0.0, 1.0 - (center_offset / max(1.0, center_limit)))
+        boundary_score = 0.92 if touches_boundary else 1.0
+        confidence = boundary_score * (
+            0.36 * min(1.0, circularity)
+            + 0.34 * min(1.0, solidity)
+            + 0.18 * aspect_score
+            + 0.12 * center_score
+        )
+        if relaxed and confidence < config.circle_relaxed_confidence_min:
+            continue
+
+        score = area * confidence
+        candidate = {
+            "center": (int(cx), int(cy)),
+            "radius": float(radius),
+            "circle_area": area,
+            "square_area": float(ratio_square_area),
+            "ratio": ratio,
+            "circularity": circularity,
+            "solidity": solidity,
+            "aspect": aspect,
+            "confidence": confidence,
+            "score": score,
+            "mode": "strict_black" if strict else "relaxed_black",
+        }
+        if best is None or score > best["score"]:
+            best = candidate
+
+    return best
 
 def draw_overlay(
     frame: np.ndarray,

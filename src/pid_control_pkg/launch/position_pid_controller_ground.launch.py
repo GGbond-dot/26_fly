@@ -22,10 +22,12 @@ def generate_launch_description() -> LaunchDescription:
         "max_angular_velocity": 30.0,
         "max_vertical_velocity": 30.0,
 
-        "visual_kp_x": 0.08, "visual_ki_x": 0.0, "visual_kd_x": 0.01,
-        "visual_kp_y": 0.08, "visual_ki_y": 0.0, "visual_kd_y": 0.01,
-        "visual_pixel_deadzone": 5.0,
-        "visual_max_xy_velocity": 20.0,
+        # Visual takeover is only used during CENTER / RECENTER_MID holds. Keep it gentle:
+        # map targets are already close enough to grab, vision should trim, not yank.
+        "visual_kp_x": 0.03, "visual_ki_x": 0.0, "visual_kd_x": 0.003,
+        "visual_kp_y": 0.03, "visual_ki_y": 0.0, "visual_kd_y": 0.003,
+        "visual_pixel_deadzone": 10.0,
+        "visual_max_xy_velocity": 6.0,
         "visual_data_timeout_sec": 0.5,
     }
 

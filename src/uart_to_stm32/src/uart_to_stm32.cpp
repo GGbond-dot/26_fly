@@ -18,7 +18,7 @@ namespace
 {
 bool isSupportedRouteChoice(uint8_t route_id)
 {
-  return route_id == 1 || route_id == 2;
+  return route_id == 1 || route_id == 2 || route_id == 3;
 }
 }  // namespace
 
@@ -29,7 +29,6 @@ UartToStm32::UartToStm32(rclcpp::Node::SharedPtr node)
   yaw_valid_(false),
   velocity_valid_(false),
   route_task_active_(false),
-  delivery_command_active_(false),
   has_st_ready_pub_(false)
 {
   RCLCPP_INFO(node_->get_logger(), "UartToStm32 created");
@@ -39,9 +38,6 @@ UartToStm32::~UartToStm32()
 {
   if (timer_) {
     timer_->cancel();
-  }
-  if (delivery_command_timer_) {
-    delivery_command_timer_->cancel();
   }
   if (serial_comm_) {
     serial_comm_->stop_protocol_receive();
@@ -89,11 +85,18 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
       "/target_velocity", 10,
       std::bind(&UartToStm32::targetVelocityCallback, this, std::placeholders::_1));
 
-    visual_aligned_apriltag_code_sub_ = node_->create_subscription<std_msgs::msg::UInt8>(
-      "/visual_aligned_apriltag_code", rclcpp::QoS(10),
-      std::bind(&UartToStm32::visualAlignedAprilTagCodeCallback, this, std::placeholders::_1));
+    servo_control_sub_ = node_->create_subscription<std_msgs::msg::UInt8>(
+      "/servo_control", rclcpp::QoS(10),
+      std::bind(&UartToStm32::servoControlCallback, this, std::placeholders::_1));
 
-      
+    electromagnet_control_sub_ = node_->create_subscription<std_msgs::msg::UInt8>(
+      "/electromagnet_control", rclcpp::QoS(10),
+      std::bind(&UartToStm32::electromagnetControlCallback, this, std::placeholders::_1));
+
+    buzzer_led_control_sub_ = node_->create_subscription<std_msgs::msg::UInt8>(
+      "/buzzer_led_control", rclcpp::QoS(10),
+      std::bind(&UartToStm32::buzzerLedControlCallback, this, std::placeholders::_1));
+
     mission_complete_sub_ = node_->create_subscription<std_msgs::msg::Empty>(
       "/mission_complete", rclcpp::QoS(10),
       std::bind(&UartToStm32::missionCompleteCallback, this, std::placeholders::_1));
@@ -103,7 +106,6 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
       "/laser_array/ground_height", rclcpp::QoS(10),
       std::bind(&UartToStm32::laserGroundHeightCallback, this, std::placeholders::_1));
 
-    delivery_command_pub_ = node_->create_publisher<std_msgs::msg::String>("/delivery_command", rclcpp::QoS(10));
     height_pub_ = node_->create_publisher<std_msgs::msg::Int16>("/height", 10);
     is_st_ready_pub_ =
       node_->create_publisher<std_msgs::msg::UInt8>("/is_st_ready", rclcpp::QoS(10).transient_local());
@@ -111,7 +113,11 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
 
     has_st_ready_pub_ = false;
 
-    
+    // 上电安全初始化：机械臂收起 + 电磁铁断电 + 蜂鸣器/LED 关闭
+    sendServoToSerial(0x00);
+    sendElectromagnetToSerial(0x00);
+    sendBuzzerLedToSerial(0x00);
+
     serial_comm_->start_protocol_receive(
       [this](uint8_t id, const std::vector<uint8_t> & data) { protocolDataHandler(id, data); },
       [this](const std::string & err) {
@@ -121,7 +127,7 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
     RCLCPP_INFO(node_->get_logger(), "UartToStm32 initialized successfully");
     RCLCPP_INFO(
       node_->get_logger(),
-      "Subscribed to /velocity_map, /route_choice, /target_velocity, /visual_aligned_apriltag_code, and /mission_complete topics");
+      "Subscribed to /velocity_map, /route_choice, /target_velocity, /servo_control, /electromagnet_control, /buzzer_led_control, and /mission_complete topics");
     return true;
 
   } catch (const std::exception & e) {
@@ -423,26 +429,52 @@ void UartToStm32::protocolDataHandler(uint8_t id, const std::vector<uint8_t> & d
   }
 }
 
-void UartToStm32::sendAprilTagCodeToSerial(uint8_t apriltag_code)
+void UartToStm32::sendServoToSerial(uint8_t state)
 {
   if (!serial_comm_ || !serial_comm_->is_open()) {
     RCLCPP_WARN_THROTTLE(
       node_->get_logger(), *node_->get_clock(), 5000,
-      "Serial port is not open, cannot send AprilTag code data");
+      "Serial port is not open, cannot send servo control data");
     return;
   }
 
-  std::vector<uint8_t> data(1, apriltag_code);
-  if (serial_comm_->send_protocol_data(APRILTAG_CODE_FRAME_ID, static_cast<uint8_t>(data.size()), data)) {
+  std::vector<uint8_t> data(1, state);
+  if (serial_comm_->send_protocol_data(SERVO_FRAME_ID, static_cast<uint8_t>(data.size()), data)) {
     RCLCPP_INFO(
       node_->get_logger(),
-      "Sent AprilTag code frame: id=0x%02X code=%u",
-      static_cast<unsigned>(APRILTAG_CODE_FRAME_ID),
-      static_cast<unsigned>(apriltag_code));
+      "Sent servo frame: id=0x%02X state=0x%02X (%s)",
+      static_cast<unsigned>(SERVO_FRAME_ID),
+      static_cast<unsigned>(state),
+      state == 0x01 ? "down" : "up");
   } else {
     RCLCPP_WARN(
       node_->get_logger(),
-      "Failed to send AprilTag code frame: %s",
+      "Failed to send servo frame: %s",
+      serial_comm_->get_last_error().c_str());
+  }
+}
+
+void UartToStm32::sendElectromagnetToSerial(uint8_t state)
+{
+  if (!serial_comm_ || !serial_comm_->is_open()) {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 5000,
+      "Serial port is not open, cannot send electromagnet control data");
+    return;
+  }
+
+  std::vector<uint8_t> data(1, state);
+  if (serial_comm_->send_protocol_data(ELECTROMAGNET_FRAME_ID, static_cast<uint8_t>(data.size()), data)) {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Sent electromagnet frame: id=0x%02X state=0x%02X (%s)",
+      static_cast<unsigned>(ELECTROMAGNET_FRAME_ID),
+      static_cast<unsigned>(state),
+      state == 0x01 ? "on" : "off");
+  } else {
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "Failed to send electromagnet frame: %s",
       serial_comm_->get_last_error().c_str());
   }
 }
@@ -471,45 +503,44 @@ void UartToStm32::sendMissionCompleteToSerial()
   }
 }
 
-void UartToStm32::publishDeliveryCommand()
+void UartToStm32::servoControlCallback(const std_msgs::msg::UInt8::SharedPtr msg)
 {
-  if (!delivery_command_pub_) {
-    RCLCPP_WARN_THROTTLE(
-      node_->get_logger(), *node_->get_clock(), 5000,
-      "/delivery_command publisher is not initialized");
-    return;
-  }
-
-  std_msgs::msg::String msg;
-  msg.data = "A";
-  delivery_command_pub_->publish(msg);
-  RCLCPP_DEBUG(node_->get_logger(), "Published /delivery_command: A Car starts delivery action!");
+  sendServoToSerial(msg->data);
 }
 
-void UartToStm32::visualAlignedAprilTagCodeCallback(const std_msgs::msg::UInt8::SharedPtr msg)
+void UartToStm32::electromagnetControlCallback(const std_msgs::msg::UInt8::SharedPtr msg)
 {
-  RCLCPP_INFO(
-    node_->get_logger(),
-    "Received aligned AprilTag code %u. Sending frame 0x%02X three times.",
-    static_cast<unsigned>(msg->data),
-    static_cast<unsigned>(APRILTAG_CODE_FRAME_ID));
+  sendElectromagnetToSerial(msg->data);
+}
 
-  for (int i = 0; i < 3; ++i) {
-    sendAprilTagCodeToSerial(msg->data);
-    std::this_thread::sleep_for(100ms);
-  }
-  
-  if (delivery_command_active_) {
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "/delivery_command periodic publish is already active. Ignoring duplicate visual alignment trigger.");
+void UartToStm32::buzzerLedControlCallback(const std_msgs::msg::UInt8::SharedPtr msg)
+{
+  sendBuzzerLedToSerial(msg->data);
+}
+
+void UartToStm32::sendBuzzerLedToSerial(uint8_t state)
+{
+  if (!serial_comm_ || !serial_comm_->is_open()) {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 5000,
+      "Serial port is not open, cannot send buzzer/LED control data");
     return;
   }
 
-  delivery_command_timer_ = node_->create_wall_timer( 1s,
-    std::bind(&UartToStm32::publishDeliveryCommand, this));
-  delivery_command_active_ = true;
-  RCLCPP_INFO(node_->get_logger(), "Started publishing /delivery_command='A' at 1 Hz.");
+  std::vector<uint8_t> data(1, state);
+  if (serial_comm_->send_protocol_data(BUZZER_LED_FRAME_ID, static_cast<uint8_t>(data.size()), data)) {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Sent buzzer/LED frame: id=0x%02X state=0x%02X (%s)",
+      static_cast<unsigned>(BUZZER_LED_FRAME_ID),
+      static_cast<unsigned>(state),
+      state == 0x01 ? "on" : "off");
+  } else {
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "Failed to send buzzer/LED frame: %s",
+      serial_comm_->get_last_error().c_str());
+  }
 }
 
 void UartToStm32::laserGroundHeightCallback(const std_msgs::msg::Int16::SharedPtr msg)
@@ -555,14 +586,6 @@ void UartToStm32::missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr)
   }
 
   route_task_active_ = false;
-  if (delivery_command_timer_) {
-    delivery_command_timer_->cancel();
-    delivery_command_timer_.reset();
-  }
-  if (delivery_command_active_) {
-    delivery_command_active_ = false;
-    RCLCPP_INFO(node_->get_logger(), "Stopped periodic publishing on /delivery_command.");
-  }
   RCLCPP_INFO(
     node_->get_logger(),
     "Mission complete sent. Target velocity forwarding is now disabled until the next valid /route_choice.");

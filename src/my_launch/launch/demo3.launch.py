@@ -1,7 +1,8 @@
 import os
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -14,6 +15,7 @@ def generate_launch_description():
          激光（抗高台），避免下降到高台正上方时点阵读数突变导致失稳。
     本文件不改动 demo2 相关启动。
     """
+    show_display = LaunchConfiguration("show_display")
 
     # 包路径
     my_carto_pkg_share        = FindPackageShare(package='my_carto_pkg').find('my_carto_pkg')
@@ -22,6 +24,8 @@ def generate_launch_description():
     activity_control_pkg_share= FindPackageShare(package='activity_control_pkg').find('activity_control_pkg')
     pillar_detector_pkg_share = FindPackageShare(package='pillar_detector_pkg').find('pillar_detector_pkg')
     laser_array_pkg_share     = FindPackageShare(package='laser_array_pkg').find('laser_array_pkg')
+    # 磁铁硬件已迁到 STM32，由 uart_to_stm32 通过 /electromagnet_control (帧 0x33) 控制。
+    # GPIO 版 magnet_control_pkg 不再启动。
 
     fly_carto_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -64,9 +68,12 @@ def generate_launch_description():
             "height": 480,
             "camera_fps": 30,
             "process_fps": 15.0,
-            "show_display": False,
+            "show_display": show_display,
             "apriltag_code": -1,
             "center_source": "square",
+            # 中心框优先指数：压掉对齐柱①时挤进画面边角的起停区 A 大方框(误锁→占比/对准跑偏)。
+            # 越大越偏向画面正中的框；0=关闭(纯面积，旧行为)。试飞嫌还抢锁就加大(3~4)。
+            "rect_center_bias": 2.0,
         }],
     )
 
@@ -78,6 +85,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument("show_display", default_value="false"),
         fly_carto_launch,
         uart_to_stm32_launch,
         position_pid_controller_launch,
