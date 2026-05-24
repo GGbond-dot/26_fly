@@ -39,6 +39,15 @@ class DetectorConfig:
     # 起停区 A/B 方框(50cm 比柱顶框大、纯面积会抢锁)。默认 2.0。
     rect_center_bias: float = 2.0
 
+    # ── 降落专用（vision_mode="land" 时 detect_landing_box 用，和柱子检测解耦）──
+    # 降落对准的是对角起停区 B 的 ≈50cm 粗黑框；它在场地角上、会和外边界连在一起、
+    # 一降高度就胀出画面，跟柱顶 15~30cm 干净带洞方框是不同场景，故单独一套参数。
+    landing_min_area: float = 600.0          # 降落候选框/黑块最小面积(px²)
+    landing_center_bias: float = 2.0         # 降落框中心优先指数（同 rect_center_bias 含义）
+    landing_oversize_frac: float = 0.72      # 框 bbox 最长边 > 此比例×画面短边 → 视为太大/出框，转质心兜底
+    landing_roi_margin_frac: float = 0.12    # 质心兜底时裁掉四周此比例边带，排除沿画面边缘的场地外边界线
+    landing_min_black_frac: float = 0.015    # 质心兜底要求中央 ROI 黑像素占比 ≥ 此值，否则判无目标(空画面不乱给中心)
+
     # Circle detection and robustness parameters.
     circle_min_area: float = 140.0
     circle_circularity_min: float = 0.50
@@ -536,6 +545,79 @@ def detect_rectangle_with_fallback(binary_primary: np.ndarray, binary_secondary:
         return det_primary
 
     return det_primary if det_primary["score"] >= det_secondary["score"] else det_secondary
+
+
+def detect_landing_box(binary: np.ndarray, config: DetectorConfig) -> Optional[dict[str, Any]]:
+    """降落专用：在黑色掩码里找对角起停区 B 的粗黑方框中心，扛“框太大/出画面”。
+
+    两段式：
+      ① 优先找中心优先的 4 角凸方框（框完整在画面里时最准，正是高空记 anchor 的时刻）。
+         框 bbox 没占满画面（最长边 ≤ landing_oversize_frac×画面短边）才采用。
+      ② 框太大/出框/没认出干净方框 → 裁掉四周边带（排除沿画面边缘的场地外边界线），
+         取中央 ROI 黑像素质心兜底（黑占比够才给，空画面返回 None，避免乱报中心）。
+    返回 {"center":(cx,cy), "polygon":Optional, "method":"quad"|"centroid"}；无目标返回 None。
+    与柱子检测完全分开，参数走 DetectorConfig 的 landing_* 字段。
+    """
+    h, w = binary.shape[:2]
+    if h == 0 or w == 0:
+        return None
+    img_cx = w * 0.5
+    img_cy = h * 0.5
+    half_diag = max(1.0, float(np.hypot(img_cx, img_cy)))
+    short_side = float(min(w, h))
+
+    # ── ① 中心优先的 4 角凸方框 ──
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < config.landing_min_area:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+        approx = cv2.approxPolyDP(contour, config.approx_eps_ratio * perimeter, True)
+        if len(approx) != 4 or not cv2.isContourConvex(approx):
+            continue
+        points = approx.reshape(-1, 2)
+        x, y, bw, bh = cv2.boundingRect(points)
+        if bw <= 0 or bh <= 0:
+            continue
+        aspect = bw / float(bh)
+        if not (config.aspect_ratio_min <= aspect <= config.aspect_ratio_max):
+            continue
+        # bbox 占满画面 = 框已胀出画面，留给质心兜底处理，不当干净方框用。
+        if max(bw, bh) > config.landing_oversize_frac * short_side:
+            continue
+        rect_cx = x + bw * 0.5
+        rect_cy = y + bh * 0.5
+        center_dist = float(np.hypot(rect_cx - img_cx, rect_cy - img_cy))
+        center_score = max(0.0, 1.0 - center_dist / half_diag)
+        score = area * (center_score ** max(0.0, config.landing_center_bias))
+        if best is None or score > best["score"]:
+            cx = float(points[:, 0].mean())
+            cy = float(points[:, 1].mean())
+            best = {"center": (cx, cy), "polygon": points, "method": "quad", "score": score}
+    if best is not None and best["score"] > 0.0:
+        return best
+
+    # ── ② 中央 ROI 黑像素质心兜底（框出框/没认出方框时）──
+    mx = int(round(w * config.landing_roi_margin_frac))
+    my = int(round(h * config.landing_roi_margin_frac))
+    mx = max(0, min(mx, w // 2 - 1))
+    my = max(0, min(my, h // 2 - 1))
+    roi = binary[my:h - my, mx:w - mx]
+    if roi.size == 0:
+        return None
+    black = int(cv2.countNonZero(roi))
+    if black < config.landing_min_black_frac * roi.size:
+        return None
+    m = cv2.moments(roi, binaryImage=True)
+    if m["m00"] <= 0:
+        return None
+    cx = mx + m["m10"] / m["m00"]
+    cy = my + m["m01"] / m["m00"]
+    return {"center": (cx, cy), "polygon": None, "method": "centroid", "score": float(black)}
 
 
 def build_inner_square_mask(shape: tuple[int, int], polygon: np.ndarray, margin: int, erode_kernel_size: int) -> tuple[np.ndarray, int]:

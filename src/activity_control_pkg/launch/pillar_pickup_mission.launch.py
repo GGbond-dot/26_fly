@@ -11,15 +11,24 @@ def generate_launch_description():
     # 放置末段 xy 偏置：可在命令行直接覆盖，如 drop_final_dy_cm:=-6.0 drop_final_dx_cm:=4.0
     drop_final_dy_cm = LaunchConfiguration("drop_final_dy_cm")
     drop_final_dx_cm = LaunchConfiguration("drop_final_dx_cm")
+    # 最高柱抓取专用收紧：可命令行覆盖，如 grab_final_height_tol_cm:=4.0 tallest_extra_grab_press_cm:=3.0
+    grab_final_height_tol_cm = LaunchConfiguration("grab_final_height_tol_cm")
+    tallest_extra_grab_press_cm = LaunchConfiguration("tallest_extra_grab_press_cm")
     return LaunchDescription([
         DeclareLaunchArgument(
-            "grab_descend_mode", default_value="segmented",
-            description="抓取下降模式：segmented(分段中停二次对准) / direct_after_center(对准+现场测高后直接盲降) / direct_no_remeasure(对准后跳过现场测高，直上直下抓取)"),
+            "grab_descend_mode", default_value="segmented_center_once",
+            description="抓取下降模式：segmented(分段中停二次对准) / segmented_center_once(分段中停但只在开头对一次中心，下降途中不再开摄像头PID) / direct_after_center(对准+现场测高后直接盲降) / direct_no_remeasure(对准后跳过现场测高，直上直下抓取)"),
         DeclareLaunchArgument(
-            "drop_final_dy_cm", default_value="-2.0",
+            "grab_final_height_tol_cm", default_value="4.0",
+            description="仅最高柱抓取末段的高度容差(cm)，<全局12逼飞机真降到位；嫌还停高可降到3~4"),
+        DeclareLaunchArgument(
+            "tallest_extra_grab_press_cm", default_value="3.0",
+            description="仅最高柱额外下压量(cm)，补窄高柱 survey 系统性偏低；够不到再加大"),
+        DeclareLaunchArgument(
+            "drop_final_dy_cm", default_value="-12.0",
             description="放置末段 y 偏置(cm)，map +y=画面左；偏左滚落可加到 -6~-7"),
         DeclareLaunchArgument(
-            "drop_final_dx_cm", default_value="4.0",
+            "drop_final_dx_cm", default_value="7.0",
             description="放置末段 x 偏置(cm)，map +x=画面正上方，正值往前补"),
         Node(
             package="activity_control_pkg",
@@ -97,8 +106,9 @@ def generate_launch_description():
                 "height_cluster_gap_cm": 8.0,
                 "height_min_cluster_frames": 3,
                 # 第二趟抓取前现场重测与第一趟柱高的最大可信差(cm)。超过=现场不可信→回退第一趟值。
-                # 量级参考：好的情况两趟差 ~4cm；5-23 柱0 暴雷差到 48cm。设 15 给激光互差留余量又能拦暴雷。
-                "live_height_consistency_cm": 15.0,
+                # 量级参考：好的情况两趟差 ~4cm；5-23 柱0 暴雷差到 48cm。
+                # 5-24 收严 15→8：那次最高柱 84−69=正好15 卡在旧阈值边界漏过(>15 不成立)→采用错值过降。
+                "live_height_consistency_cm": 8.0,
 
                 # 铁片占比采样（判大小，决定叠放顺序）。第一趟 CENTER 期间累积
                 # /circle_area_ratio，少于此帧数则判该柱为空柱（无铁片）。
@@ -119,18 +129,34 @@ def generate_launch_description():
                 "descend_seg_len_cm": 30.0,
                 # 抓取最小片（pickup_order 末位）时用更密的 20cm 分段；放置不加密，仍用 descend_seg_len_cm。
                 "descend_seg_len_min_plate_cm": 20.0,
+                # 最小片太小，爬回巡航高度后容易误判；抓完先在巡航高度下方 20cm 观察。
+                # 若判定已抓走，再爬回巡航高度继续放置；若仍看到圆盘，则从该低高度继续下降重试。
+                "min_plate_observe_drop_cm": 20.0,
                 "descend_min_tail_cm": 20.0,
                 # 下降安全底线(cm)：抓取下降中面阵读数 < 此值（臂尖将到地面以下=物理不可能，多半柱高测错
                 # 或飞机偏离柱子在往地面狂降）立即中止下降、爬回重测重试，不用人工拔电。
                 # 取 R(臂触地面阵读数,宏 ARM_GROUND_AREA_CM=27) 再减 ~5cm 余量 = 22。短柱正常抓取面阵不会低于 R，不误触发。
                 "descend_abort_area_cm": 22.0,
+                # 面阵"虚高判废"(5-24 新增)：喂飞控的 z 反馈仍照常用面阵(不可突变)，这里只做判废统计。
+                # 抓取下降中面阵不可能高于巡航高度；倾斜蹭柱时 max() 斜射会虚高(5-24 第2片读 180 持续~20s，
+                # 飞控被骗着下压死压柱子、安全底线<22 也被虚高蒙住)。面阵 > 巡航高度+margin 即记一帧虚高，
+                # 连续达 frames 帧 → 判面阵不可信/这根柱子抓不到，直接放弃此柱(不重试)。
+                # frames 要足够大以免误判（那次虚高约 40 帧@2Hz）；默认 10≈5s，嫌误判调大。
+                "descend_area_anomaly_margin_cm": 15.0,
+                "descend_area_anomaly_frames": 10,
                 # 抓取下压量(cm)：z=R+柱高-grab_press。grab_press 越大降得越低。
                 # 5-23 分段下降版实飞：grab_press=0 时臂尖停在柱顶面上方约4cm够不到 → 设 4。
                 # 还吸不牢够不到→继续回调正值；反而下降过头压坏→回调（最小到 0 或设负值）。
                 "grab_press_cm": 4.0,
+                # 最高柱抓取专用收紧（见 18.11）：窄高柱 survey 偏低~3cm，全局 12cm 容差太松→停高 2~4cm 臂尖够不到。
+                # 仅对待抓柱里最高那根生效：末段高度容差换成 grab_final_height_tol，并多压 tallest_extra_grab_press。
+                "grab_final_height_tol_cm": ParameterValue(grab_final_height_tol_cm, value_type=float),
+                "tallest_extra_grab_press_cm": ParameterValue(tallest_extra_grab_press_cm, value_type=float),
                 # 抓取下降模式 A/B 实验开关：
-                #   "segmented"          = 当前方案：CENTER 对准一次 → 下降中每段 RECENTER_MID 再对准（默认）。
-                #   "direct_after_center"= CENTER 对准一次后直接盲降到抓取高度，下降途中不再视觉微调。
+                #   "segmented"            = 当前方案：CENTER 对准一次 → 下降中每段 RECENTER_MID 再开摄像头 PID 对准（默认）。
+                #   "segmented_center_once"= 仍分段中停，但只在开头 CENTER 用摄像头 PID 对一次中心，下降途中的中停不再开视觉，
+                #                            只保持位置往下降（复刻"对一次中心后不再用摄像头 PID"的旧行为）。
+                #   "direct_after_center"  = CENTER 对准一次后直接盲降到抓取高度，下降途中不再视觉微调。
                 # 两种模式都【会先在 CENTER 微调一次】，区别只在下降途中是否继续分段对准。切换即做对比试飞。
                 # 命令行覆盖：... grab_descend_mode:=direct_after_center
                 "grab_descend_mode": grab_descend_mode,

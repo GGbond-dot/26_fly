@@ -9,6 +9,7 @@
 #   ./scripts/run_test.sh                      # 默认跑 demo3.launch.py
 #   ./scripts/run_test.sh demo_basic.launch.py # 跑别的 launch
 #   ./scripts/run_test.sh demo3.launch.py enable_debug_topic_info:=false   # 透传 launch 参数
+#   demo3.launch.py 会自动带现场调好的默认参数；命令行同名参数仍可覆盖。
 #
 # 产物（默认在 ~/fly_logs/）：
 #   run_<时间戳>.log     控制台日志
@@ -24,6 +25,30 @@ LAUNCH_PKG="my_launch"
 LAUNCH_FILE="${1:-demo3.launch.py}"
 shift || true              # 余下参数透传给 ros2 launch
 LAUNCH_ARGS=("$@")
+
+has_launch_arg() {
+  local key="$1"
+  local arg
+  for arg in "${LAUNCH_ARGS[@]}"; do
+    [[ "$arg" == "$key:="* ]] && return 0
+  done
+  return 1
+}
+
+add_default_launch_arg() {
+  local arg="$1"
+  local key="${arg%%:=*}"
+  has_launch_arg "$key" || LAUNCH_ARGS+=("$arg")
+}
+
+if [[ "$LAUNCH_FILE" == "demo3.launch.py" ]]; then
+  add_default_launch_arg "show_display:=true"
+  add_default_launch_arg "grab_descend_mode:=segmented_center_once"
+  add_default_launch_arg "grab_final_height_tol_cm:=4.0"
+  add_default_launch_arg "tallest_extra_grab_press_cm:=3.0"
+  add_default_launch_arg "drop_final_dy_cm:=-12.0"
+  add_default_launch_arg "drop_final_dx_cm:=7.0"
+fi
 
 # 环境变量（ROS humble + 本工作空间）已在 .bashrc 里 source 好，这里不重复。
 

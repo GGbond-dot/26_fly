@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,7 @@
 #include <std_msgs/msg/int16.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -124,8 +126,9 @@ enum class PickupSub
   RECENTER_MID,     // 中停高度二次视觉对准（分段对准，带超时防卡死）
   DESCEND_FINAL,    // 盲降到 R + 柱高 − grab_press（最后一段，压住吸取）
   HOVER_GRAB,       // 机械臂伸出 + 吸磁，悬停
-  CLIMB_BACK,       // 爬回巡航高度
+  CLIMB_BACK,       // 爬回观察高度（普通片=巡航高度；最小片=巡航高度下方 min_plate_observe_drop_cm）
   OBSERVE_GRAB,     // 观察 /circle_area_ratio 判抓取成败 / 重试
+  CLIMB_AFTER_OBSERVE_GRAB, // 最小片低高度确认抓走后，先爬回巡航高度再去放置
   GOTO_DROP,        // 飞到空柱上方
   CENTER_DROP,      // 视觉对准空柱边框中心（接管，仅 xy 精对；空柱高第一趟已测）
   DESCEND_DROP,     // 下降到 R + 空柱高 + 已叠高度 + drop_gap
@@ -159,13 +162,15 @@ private:
 
   // ── 姿态 / 到位判定 ──
   bool getCurrentPose(double & x_cm, double & y_cm, double & yaw_deg);
+  // height_tol_override>0 时用它替代全局 height_tol_cm_（最高柱抓取末段单独收紧用）。
   bool isReached(const PickupWaypoint & wp, double x_cm, double y_cm,
-                 double z_cm, double yaw_deg) const;
+                 double z_cm, double yaw_deg, double height_tol_override = -1.0) const;
 
   // ── 发布 ──
   void publishTarget(const PickupWaypoint & wp, bool verbose = true);
   void publishEnable(bool on);
   void publishVisualTakeover(bool on);
+  void publishVisionMode(const std::string & mode);  // "pillar"=柱子检测；"land"=降落 B 框专用检测
   void publishActiveController(uint8_t mode);
   void publishServo(bool extended);   // true=机械臂伸出, false=收起（串口帧 0x11）
   void publishMagnet(bool on);        // true=吸, false=松（串口帧 0x33）
@@ -194,8 +199,14 @@ private:
   std::size_t nearestToLanding() const;
 
   bool isVisuallyAligned() const;
-  void recordFineData(int dx_px, int dy_px);
+  // valid=false 表示视觉丢框(/fine_data 第三位=0)：降落阶段不计入对准历史，
+  // 避免 [0,0] 被 isVisuallyAligned 当成“已对准”而拿漂移位置记 anchor。
+  void recordFineData(int dx_px, int dy_px, bool valid = true);
   bool shouldSkipGrabVisual() const;
+  // 抓取分段下降的中停(RECENTER_MID)是否跳过摄像头 PID 二次对准：
+  // segmented_center_once 模式=只在开头 CENTER 对一次中心，之后分段中停一律不再开视觉；
+  // 或最大铁片(shouldSkipGrabVisual)本就跳中停微调。
+  bool skipMidRecenter() const;
   void getDropTargetXY(double & x_cm, double & y_cm) const;
   bool dropVisionCircleVeto() const;
   void updateDropAnchorFromVision(double x_cm, double y_cm, const char * reason);
@@ -269,8 +280,15 @@ private:
   double descend_min_tail_cm_;      // 分段下降：最后盲降段下限，剩余 < seg+tail 不再分段（默认 20）
   double descend_recenter_timeout_sec_; // 中停二次对准超时（防卡死，默认 2.5）
   double descend_abort_area_cm_; // 下降安全底线：面阵读数 < 此值(臂尖将到地面以下=不可能)立即中止下降爬回重试（默认22≈R-5）
+  // 面阵"虚高判废"：抓取下降中面阵不可能高于巡航高度；倾斜蹭柱时 max() 斜射会虚高(5-24 第2片读到180持续~20s)，
+  // 飞控被"我还很高"骗着继续下压→死压柱子。喂飞控的 z 反馈仍照常用面阵(不可突变)，只是连续虚高够多帧→判这根柱子抓不到、直接放弃。
+  double descend_area_anomaly_margin_cm_; // 面阵 > 巡航高度 + 此余量 视为"虚高异常"帧（默认15）
+  int    descend_area_anomaly_frames_;    // 连续虚高异常达此帧数 → 判面阵不可信/抓不到，放弃该柱（默认10≈5s@2Hz；调大更不易误判）
   double descend_seg_len_min_plate_cm_; // 抓最小片时用更短分段（默认20），放置不加密
+  double min_plate_observe_drop_cm_; // 最小片抓取判定前，把观察高度从巡航高度下调此距离（默认20cm）
   double grab_press_cm_;      // 抓取下压量：z = R + 柱高 − grab_press（压住铁片确保吸牢）
+  double grab_final_height_tol_cm_;    // 仅最高柱抓取末段高度容差（<全局 height_tol，逼飞机真降到位，见 18.11）
+  double tallest_extra_grab_press_cm_; // 仅最高柱额外下压量：补窄高柱 survey 系统性偏低~3cm
   double drop_gap_cm_;        // （放置已改"上方释放"，不再使用；保留避免参数报错）
   double drop_press_cm_;      // （放置已改"上方释放"，不再使用；保留避免参数报错）
   double drop_release_clearance_cm_;   // 放置末段不贴死：z = R + 空柱高 + 已叠 + 此余隙（叠面上方释放）
@@ -278,7 +296,8 @@ private:
   double grab_final_dy_cm_;   // 抓取末段盲降额外 y 偏置（放置不用）
   double drop_final_dy_cm_;    // 放置末段额外 y 偏置：补电磁铁吸取点物理偏置，防铁片偏左滚落（与 grab 同向，map +y=画面左）
   double drop_final_dx_cm_;    // 放置末段额外 x 偏置（map +x=画面正上方）：放置专用，正值往前补
-  // 抓取下降模式 A/B：segmented=分段中停二次对准；direct_after_center=对准中心后直接盲降到位（不分段）
+  // 抓取下降模式：segmented=分段中停二次对准；segmented_center_once=分段中停但只开头对一次中心、下降不再开摄像头PID；
+  //              direct_after_center=对准中心后直接盲降到位（不分段）；direct_no_remeasure=对准后跳过现场测高直上直下
   std::string grab_descend_mode_;
   double arm_extend_sec_;     // 放置时机械臂伸直到位耗时
   double drop_settle_sec_;    // （放置已改用 drop_post_release_hover_sec；保留避免参数报错）
@@ -338,6 +357,7 @@ private:
 
   // 第二趟
   std::vector<std::size_t> pickup_order_;      // 待抓铁片柱索引，按占比大→小
+  std::size_t tallest_pickup_si_ = SIZE_MAX;   // 待抓柱里最高的那根(survey索引)，抓取单独收紧容差+多压；SIZE_MAX=无
   std::size_t pickup_iter_;
   PickupSub   pickup_sub_;
   int         stack_count_ = 0;                // 已叠到空柱上的铁片数
@@ -384,6 +404,7 @@ private:
   // 激光数据
   bool   has_area_height_;
   double area_height_cm_;
+  int    area_high_streak_ = 0;   // 面阵连续"虚高异常"帧计数（虚高判废用；正常帧即清零）
   bool   has_point_height_;
   double point_height_cm_;
 
@@ -398,6 +419,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                 enable_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                 visual_takeover_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr                 visual_takeover_active_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr               vision_mode_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr                active_controller_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr                route_choice_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr                servo_pub_;

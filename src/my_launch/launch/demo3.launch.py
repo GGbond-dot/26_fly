@@ -19,6 +19,8 @@ def generate_launch_description():
     grab_descend_mode = LaunchConfiguration("grab_descend_mode")
     drop_final_dy_cm = LaunchConfiguration("drop_final_dy_cm")
     drop_final_dx_cm = LaunchConfiguration("drop_final_dx_cm")
+    grab_final_height_tol_cm = LaunchConfiguration("grab_final_height_tol_cm")
+    tallest_extra_grab_press_cm = LaunchConfiguration("tallest_extra_grab_press_cm")
 
     # 包路径
     my_carto_pkg_share        = FindPackageShare(package='my_carto_pkg').find('my_carto_pkg')
@@ -56,6 +58,8 @@ def generate_launch_description():
             "grab_descend_mode": grab_descend_mode,
             "drop_final_dy_cm": drop_final_dy_cm,
             "drop_final_dx_cm": drop_final_dx_cm,
+            "grab_final_height_tol_cm": grab_final_height_tol_cm,
+            "tallest_extra_grab_press_cm": tallest_extra_grab_press_cm,
         }.items()
     )
     pillar_detector_tf_launch = IncludeLaunchDescription(
@@ -82,6 +86,13 @@ def generate_launch_description():
             # 中心框优先指数：压掉对齐柱①时挤进画面边角的起停区 A 大方框(误锁→占比/对准跑偏)。
             # 越大越偏向画面正中的框；0=关闭(纯面积，旧行为)。试飞嫌还抢锁就加大(3~4)。
             "rect_center_bias": 2.0,
+            # ── 降落专用检测（mission 发 /vision_mode=land 时生效，和柱子检测解耦）──
+            # 只找对角起停区 B 的 ≈50cm 粗黑框中心；框胀出画面时退化为中央 ROI 黑像素质心。
+            "landing_min_area": 600.0,          # 降落候选框/黑块最小面积(px²)
+            "landing_center_bias": 2.0,         # 降落框中心优先指数（同 rect_center_bias 含义）
+            "landing_oversize_frac": 0.72,      # 框最长边 > 此比例×画面短边 → 太大/出框，转质心兜底
+            "landing_roi_margin_frac": 0.12,    # 质心兜底裁掉四周此比例边带，排除场地外边界线
+            "landing_min_black_frac": 0.015,    # 中央 ROI 黑占比 < 此值判无目标(空画面不乱报中心)
         }],
     )
 
@@ -93,16 +104,22 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("show_display", default_value="false"),
+        DeclareLaunchArgument("show_display", default_value="true"),
         DeclareLaunchArgument(
-            "grab_descend_mode", default_value="segmented",
-            description="抓取下降模式 A/B：segmented(默认,分段中停二次对准) / direct_after_center(对准+现场测高后直接盲降) / direct_no_remeasure(对准后跳过现场测高,直上直下)"),
+            "grab_descend_mode", default_value="segmented_center_once",
+            description="抓取下降模式 A/B：segmented(默认,分段中停二次对准) / segmented_center_once(分段中停但只开头对一次中心,下降不再开摄像头PID) / direct_after_center(对准+现场测高后直接盲降) / direct_no_remeasure(对准后跳过现场测高,直上直下)"),
         DeclareLaunchArgument(
-            "drop_final_dy_cm", default_value="-2.0",
+            "drop_final_dy_cm", default_value="-12.0",
             description="放置末段 y 偏置(cm)，map +y=画面左；偏左滚落可加到 -6~-7"),
         DeclareLaunchArgument(
-            "drop_final_dx_cm", default_value="4.0",
+            "drop_final_dx_cm", default_value="7.0",
             description="放置末段 x 偏置(cm)，map +x=画面正上方，正值往前补"),
+        DeclareLaunchArgument(
+            "grab_final_height_tol_cm", default_value="4.0",
+            description="仅最高柱抓取末段高度容差(cm)，<全局12逼飞机真降到位；嫌停高可降到3~4"),
+        DeclareLaunchArgument(
+            "tallest_extra_grab_press_cm", default_value="3.0",
+            description="仅最高柱额外下压量(cm)，补窄高柱 survey 偏低；够不到再加大"),
         fly_carto_launch,
         uart_to_stm32_launch,
         position_pid_controller_launch,
