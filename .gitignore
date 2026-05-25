@@ -20,3 +20,5 @@ __pycache__/
 build/
 install/
 log/
+# 忽略飞行日志数据（bag/csv/log，体积大且可再生）
+log_fly/
