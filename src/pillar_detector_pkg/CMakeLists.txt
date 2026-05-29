@@ -56,9 +56,29 @@ else()
   target_compile_options(pillar_detector_tf PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# ── 新增（G 题，spray-task）：单杆塔检测节点，输出 /detected_pillar ──
+add_executable(pillar_detector_single_node
+  src/pillar_detector_single_node.cpp
+  src/pillar_detector_single_main.cpp
+)
+target_include_directories(pillar_detector_single_node PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(pillar_detector_single_node
+  rclcpp
+  sensor_msgs
+  std_msgs
+)
+if(MSVC)
+  target_compile_options(pillar_detector_single_node PRIVATE /W4)
+else()
+  target_compile_options(pillar_detector_single_node PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 install(TARGETS
   pillar_detector_node
   pillar_detector_tf
+  pillar_detector_single_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

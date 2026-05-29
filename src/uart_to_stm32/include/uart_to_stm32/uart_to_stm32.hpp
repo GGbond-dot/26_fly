@@ -46,6 +46,8 @@ private:
   void electromagnetControlCallback(const std_msgs::msg::UInt8::SharedPtr msg);
   void buzzerLedControlCallback(const std_msgs::msg::UInt8::SharedPtr msg);
   void sendBuzzerLedToSerial(uint8_t state);
+  void ledDigitCallback(const std_msgs::msg::UInt8::SharedPtr msg);
+  void sendLedDigitToSerial(uint8_t digit);
   void missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr msg);
   void laserGroundHeightCallback(const std_msgs::msg::Int16::SharedPtr msg);
   void sendLaserGroundHeightToSerial(int16_t height_cm);
@@ -65,6 +67,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr servo_control_sub_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr electromagnet_control_sub_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr buzzer_led_control_sub_;
+  rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr led_digit_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr mission_complete_sub_;
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr laser_ground_height_sub_;
 
@@ -87,6 +90,8 @@ private:
   static constexpr uint8_t SERVO_FRAME_ID = 0x11;          // 0x01=放下机械臂, 0x00=收起机械臂
   static constexpr uint8_t ELECTROMAGNET_FRAME_ID = 0x33;  // 0x01=通电(吸), 0x00=断电(松)
   static constexpr uint8_t BUZZER_LED_FRAME_ID = 0x22;     // 0x01=蜂鸣器+LED开, 0x00=关（声光绑同一帧）
+  // G 题（spray-task）新增：1B digit, LED 闪烁该次数显示条形码数字
+  static constexpr uint8_t LED_DIGIT_FRAME_ID = 0x12;
   static constexpr uint8_t MISSION_COMPLETE_FRAME_ID = 0x66;
   static constexpr uint8_t MISSION_COMPLETE_VALUE = 0x06;
   static constexpr uint8_t LASER_GROUND_HEIGHT_FRAME_ID = 0x07;  // 2B int16 little-endian, 单位 cm

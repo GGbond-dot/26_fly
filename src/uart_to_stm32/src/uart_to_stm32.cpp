@@ -97,6 +97,11 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
       "/buzzer_led_control", rclcpp::QoS(10),
       std::bind(&UartToStm32::buzzerLedControlCallback, this, std::placeholders::_1));
 
+    // G 题（spray-task）：LED 数字显示，1B digit，帧 0x12
+    led_digit_sub_ = node_->create_subscription<std_msgs::msg::UInt8>(
+      "/led_digit", rclcpp::QoS(10),
+      std::bind(&UartToStm32::ledDigitCallback, this, std::placeholders::_1));
+
     mission_complete_sub_ = node_->create_subscription<std_msgs::msg::Empty>(
       "/mission_complete", rclcpp::QoS(10),
       std::bind(&UartToStm32::missionCompleteCallback, this, std::placeholders::_1));
@@ -127,7 +132,7 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
     RCLCPP_INFO(node_->get_logger(), "UartToStm32 initialized successfully");
     RCLCPP_INFO(
       node_->get_logger(),
-      "Subscribed to /velocity_map, /route_choice, /target_velocity, /servo_control, /electromagnet_control, /buzzer_led_control, and /mission_complete topics");
+      "Subscribed to /velocity_map, /route_choice, /target_velocity, /servo_control, /electromagnet_control, /buzzer_led_control, /led_digit, and /mission_complete topics");
     return true;
 
   } catch (const std::exception & e) {
@@ -516,6 +521,35 @@ void UartToStm32::electromagnetControlCallback(const std_msgs::msg::UInt8::Share
 void UartToStm32::buzzerLedControlCallback(const std_msgs::msg::UInt8::SharedPtr msg)
 {
   sendBuzzerLedToSerial(msg->data);
+}
+
+void UartToStm32::ledDigitCallback(const std_msgs::msg::UInt8::SharedPtr msg)
+{
+  sendLedDigitToSerial(msg->data);
+}
+
+void UartToStm32::sendLedDigitToSerial(uint8_t digit)
+{
+  if (!serial_comm_ || !serial_comm_->is_open()) {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 5000,
+      "Serial port is not open, cannot send LED digit data");
+    return;
+  }
+
+  std::vector<uint8_t> data(1, digit);
+  if (serial_comm_->send_protocol_data(LED_DIGIT_FRAME_ID, static_cast<uint8_t>(data.size()), data)) {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Sent LED digit frame: id=0x%02X digit=%u",
+      static_cast<unsigned>(LED_DIGIT_FRAME_ID),
+      static_cast<unsigned>(digit));
+  } else {
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "Failed to send LED digit frame: %s",
+      serial_comm_->get_last_error().c_str());
+  }
 }
 
 void UartToStm32::sendBuzzerLedToSerial(uint8_t state)
