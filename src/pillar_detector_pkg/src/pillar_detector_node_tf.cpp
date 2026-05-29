@@ -40,6 +40,9 @@ PillarDetectorTFNode::PillarDetectorTFNode(const rclcpp::NodeOptions & options)
 
   tf_timeout_sec_ = declare_parameter("tf_timeout_sec", 0.05);
 
+  publish_debug_points_ = declare_parameter("publish_debug_points", true);
+  debug_points_topic_   = declare_parameter<std::string>("debug_points_topic", "/pillar_debug_points");
+
   tf_buffer_   = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
@@ -55,6 +58,11 @@ PillarDetectorTFNode::PillarDetectorTFNode(const rclcpp::NodeOptions & options)
   pillars_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(
     "/detected_pillars",
     rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable());
+
+  if (publish_debug_points_) {
+    debug_points_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>(
+      debug_points_topic_, rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+  }
 
   RCLCPP_INFO(get_logger(),
     "TF 柱子检测启动: scan='%s' enable='%s' frames=[%s <- %s]",
@@ -147,6 +155,17 @@ std::vector<DetectionTF> PillarDetectorTFNode::detectInFrame(
     {
       in_bounds.push_back({xm, ym});
     }
+  }
+
+  // 旁路：把本帧落进 bbox 的 map 系原始点发出来供调参（不参与下面的检测）。
+  if (publish_debug_points_ && debug_points_pub_ && !in_bounds.empty()) {
+    std_msgs::msg::Float32MultiArray dbg;
+    dbg.data.reserve(in_bounds.size() * 2);
+    for (const auto & p : in_bounds) {
+      dbg.data.push_back(static_cast<float>(p.x));
+      dbg.data.push_back(static_cast<float>(p.y));
+    }
+    debug_points_pub_->publish(dbg);
   }
 
   if (in_bounds.empty()) { return detections; }

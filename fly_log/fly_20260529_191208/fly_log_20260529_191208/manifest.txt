@@ -1,0 +1,6 @@
+collected_at=2026-05-29T19:15:33+08:00
+source_log_dir=/home/orangepi/fly_logs
+autostart_log=/home/orangepi/fly_logs/autostart_20260529_191208.log
+run_log=/home/orangepi/fly_logs/run_20260529_191208.log
+bag_dir=/home/orangepi/fly_logs/bag_20260529_191208
+target=kian@192.168.10.116:/home/kian/kian_26fly/fly_log

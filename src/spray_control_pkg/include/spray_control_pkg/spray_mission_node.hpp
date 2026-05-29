@@ -39,7 +39,7 @@ enum class MissionPhase
 {
   TAKEOFF,     // "十"字起降点垂直起飞，升至巡航高度 150cm
   GOTO_A,      // 飞往播撒起点区块 A（编号 21）
-  COVERAGE,    // 蛇形全覆盖；途中可能穿插 BARCODE_OBSERVE 航点
+  COVERAGE,    // 蛇形全覆盖；覆盖结束、返航前插入条码"降-读-升"三段（柱子在回 home 顺路上）
   RETURN,      // 飞回起降点上空
   LAND,        // 垂直降落，几何中心对准"十"字（±10cm）。
                // 若 barcode_number_ > 0 则改为圆周降落（半径 N×10cm）
@@ -51,13 +51,15 @@ enum class MissionPhase
 // 接口约定（与本机搬运代码 + PID/uart 一致；激光复用电磁铁链路）：
 //   发布 /target_position        Float32MultiArray = [x_cm, y_cm, z_cm, yaw_deg]
 //   发布 /active_controller      UInt8  (2=位置控制器接管, 0=停)
+//   发布 /route_choice           UInt8  (1 → uart_to_stm32 开门，使能 /target_velocity 转发到飞控)
 //   发布 /electromagnet_control  UInt8  (1=激光开, 0=关) ← 物理上激光接在电磁铁 GPIO，复用 0x33 帧
 //   发布 /led_digit              UInt8  (1~9 → STM32 LED 闪烁次数显示条码数字，新增 0x12 帧)
 //   发布 /mission_complete       Empty
 //   订阅 /height                 Int16  (cm，由 uart_to_stm32 从 STM32 上报)
 //   订阅 /spray_allowed          Bool   (下视相机中心 ROI 见绿色 = true)
 //   订阅 /barcode_text           String (pyzbar 识到的 Code128 文本)
-//   订阅 /detected_pillar        Float32MultiArray [x_m, y_m] (单杆塔 2D 坐标)
+//   发布 /pillar_detect_enable   Bool   (起飞后开窗 true→攒帧, 关窗 false→tf 检测器聚类发布)
+//   订阅 /detected_pillars       Float32MultiArray [x_m, y_m, ...] (tf 版按票数降序, 取首个=最佳)
 //   位姿通过 tf2: map → laser_link
 class SprayMissionNode : public rclcpp::Node
 {
@@ -80,7 +82,12 @@ private:
   void publishTarget(const SprayWaypoint & wp);
   void publishLaser(bool on);
   void publishLedDigit(uint8_t digit);
+  void publishPillarDetectEnable(bool on);
   void advance();
+
+  // 起飞后管理柱子检测窗：开窗→tf 检测器在 map 系攒帧；window_sec 后关窗→检测器聚类发布。
+  // 不再起飞前死等；时间上限由 pillar_detect_window_sec_ 卡死。
+  void managePillarDetectWindow();
 
   // 撒药子状态机（颜色门控）：到达 spray 航点后调用。
   // 返回 true 表示本航点 spray 流程结束（可能闪了 2 次，也可能跳过）。
@@ -90,7 +97,7 @@ private:
   // 返回 true 表示识别完成、已发 LED、可推进下一航点。
   bool runBarcodeObserve();
 
-  // 把单杆塔位置作为观察航点插入到当前航点表（GOTO_A 之后、COVERAGE 之前）。
+  // 把单杆塔位置展开成"接近(巡航高)/观察(低空悬停读)/拉高"三段，插入到返航(return)航点之前。
   void insertBarcodeObserveWaypoint(double pillar_x_m, double pillar_y_m);
 
   void buildCoverageWaypoints();
@@ -126,7 +133,9 @@ private:
 
   // 条码任务参数
   bool   enable_barcode_task_;
-  double pillar_left_offset_m_;      // 观察点 = (px, py + offset)，对应朋友的 0.8m
+  double pillar_detect_window_sec_;  // 起飞后柱子检测窗时长，关窗即锁定（"别判太久"上限）
+  double pillar_observe_offset_m_;   // 观察点离杆塔的水平后撤距离（本机相机焦距/视场决定）
+  std::string barcode_cam_axis_;     // 二维码相机在机体(yaw=0)下的朝向："+x"(本机,装正前方)/"-x"/"+y"/"-y"(朋友)
   double barcode_target_z_cm_;       // 观察点高度（瞄条码段中心，105~125cm）
   double barcode_wait_timeout_sec_;  // 悬停等条码最长时间
 
@@ -156,12 +165,17 @@ private:
   bool          barcode_detected_;
   std::string   latest_barcode_text_;
   int           barcode_number_;     // 解析出的数字（4 位 Code128）
+  bool          led_digit_sent_;     // 已在降落后发过 LED，防重复
+  bool          has_been_airborne_;  // 曾经高于 50cm，用于区分降落与起飞前
 
-  // 杆塔订阅 / 早期插入
+  // 杆塔订阅 / 检测窗 / 插入
   bool          pillar_received_;
   bool          pillar_inserted_;
   double        pillar_x_m_;
   double        pillar_y_m_;
+  bool          pillar_window_opened_;   // 已发 enable=true 开窗
+  bool          pillar_window_closed_;   // 已发 enable=false 关窗（之后才接收 /detected_pillars）
+  rclcpp::Time  pillar_window_start_time_;
 
   // 颜色门控订阅状态
   bool          has_spray_allowed_;
@@ -171,8 +185,10 @@ private:
   // ── ROS ──
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr target_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr             active_controller_pub_;
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr             route_choice_pub_;    // 给 uart_to_stm32 开门，使能 /target_velocity 转发
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr             electromagnet_pub_;   // 复用电磁铁链路控激光
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr             led_digit_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr             pillar_detect_enable_pub_;  // 给 tf 检测器开/关检测窗
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr             mission_complete_pub_;
 
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr              height_sub_;

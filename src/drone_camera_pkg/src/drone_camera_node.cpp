@@ -24,6 +24,8 @@ public:
     fps_(declare_parameter<double>("fps", 15.0)),
     window_name_(declare_parameter<std::string>("window_name", "drone_camera_preview")),
     spray_allowed_topic_(declare_parameter<std::string>("spray_allowed_topic", "/spray_allowed")),
+    fourcc_(declare_parameter<std::string>("fourcc", "MJPG")),
+    rotate_code_(declare_parameter<int>("rotate_code", -1)),
     center_roi_width_(declare_parameter<int>("center_roi_width", 50)),
     center_roi_height_(declare_parameter<int>("center_roi_height", 50)),
     green_h_min_(declare_parameter<int>("green_h_min", 25)),
@@ -35,10 +37,18 @@ public:
     spray_allowed_pub_ =
       create_publisher<std_msgs::msg::Bool>(spray_allowed_topic_, rclcpp::QoS(10));
 
-    if (!camera_.open(camera_device_)) {
-      throw std::runtime_error("Failed to open camera device " + camera_device_);
+    // 下视相机(down_cam，/dev/video0)。必须用 V4L2 后端 + 强制 MJPG，
+    // 否则默认 YUYV 在高分辨率下只有 3fps，画面巨卡。
+    if (!camera_.open(camera_device_, cv::CAP_V4L2)) {
+      throw std::runtime_error("[down_cam] 打开下视相机失败: " + camera_device_);
     }
 
+    // FOURCC 必须在设分辨率之前设置
+    if (fourcc_.size() == 4) {
+      camera_.set(
+        cv::CAP_PROP_FOURCC,
+        cv::VideoWriter::fourcc(fourcc_[0], fourcc_[1], fourcc_[2], fourcc_[3]));
+    }
     if (frame_width_ > 0) {
       camera_.set(cv::CAP_PROP_FRAME_WIDTH, frame_width_);
     }
@@ -48,6 +58,22 @@ public:
     if (fps_ > 0.0) {
       camera_.set(cv::CAP_PROP_FPS, fps_);
     }
+
+    // 打印实际生效的格式（驱动可能把请求值改掉）
+    const int got_fourcc = static_cast<int>(camera_.get(cv::CAP_PROP_FOURCC));
+    char fcc[5] = {
+      static_cast<char>(got_fourcc & 0xFF),
+      static_cast<char>((got_fourcc >> 8) & 0xFF),
+      static_cast<char>((got_fourcc >> 16) & 0xFF),
+      static_cast<char>((got_fourcc >> 24) & 0xFF),
+      '\0'};
+    RCLCPP_INFO(
+      get_logger(),
+      "[down_cam] 已打开 %s  fourcc=%s  %.0fx%.0f @ %.0ffps",
+      camera_device_.c_str(), fcc,
+      camera_.get(cv::CAP_PROP_FRAME_WIDTH),
+      camera_.get(cv::CAP_PROP_FRAME_HEIGHT),
+      camera_.get(cv::CAP_PROP_FPS));
 
     const auto period = std::chrono::duration<double>(1.0 / std::max(fps_, 1.0));
     frame_timer_ = create_wall_timer(
@@ -130,6 +156,11 @@ private:
       }
     }
 
+    // rotate_code: -1=不转, 0=顺时针90, 1=180, 2=逆时针90（= cv::ROTATE_* 取值）
+    if (rotate_code_ >= 0) {
+      cv::rotate(frame, frame, rotate_code_);
+    }
+
     detectFieldColorAndPublish(frame);
     cv::imshow(window_name_, frame);
     cv::waitKey(1);
@@ -141,6 +172,8 @@ private:
   double fps_;
   std::string window_name_;
   std::string spray_allowed_topic_;
+  std::string fourcc_;
+  int rotate_code_;
   int center_roi_width_;
   int center_roi_height_;
   int green_h_min_;

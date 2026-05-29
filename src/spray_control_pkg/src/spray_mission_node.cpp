@@ -24,10 +24,14 @@ SprayMissionNode::SprayMissionNode(const rclcpp::NodeOptions & options)
   barcode_observe_active_(false),
   barcode_detected_(false),
   barcode_number_(0),
+  led_digit_sent_(false),
+  has_been_airborne_(false),
   pillar_received_(false),
   pillar_inserted_(false),
   pillar_x_m_(0.0),
   pillar_y_m_(0.0),
+  pillar_window_opened_(false),
+  pillar_window_closed_(false),
   has_spray_allowed_(false),
   latest_spray_allowed_(false),
   has_height_(false),
@@ -55,7 +59,9 @@ SprayMissionNode::SprayMissionNode(const rclcpp::NodeOptions & options)
   spray_off_sec_                = declare_parameter<double>("spray_off_sec", 0.3);
 
   enable_barcode_task_      = declare_parameter<bool>("enable_barcode_task", false);
-  pillar_left_offset_m_     = declare_parameter<double>("pillar_left_offset_m", 0.8);
+  pillar_detect_window_sec_ = declare_parameter<double>("pillar_detect_window_sec", 4.0);
+  pillar_observe_offset_m_  = declare_parameter<double>("pillar_observe_offset_m", 0.8);
+  barcode_cam_axis_         = declare_parameter<std::string>("barcode_cam_axis", "+x");
   barcode_target_z_cm_      = declare_parameter<double>("barcode_target_z_cm", 105.0);
   barcode_wait_timeout_sec_ = declare_parameter<double>("barcode_wait_timeout_sec", 8.0);
 
@@ -69,9 +75,15 @@ SprayMissionNode::SprayMissionNode(const rclcpp::NodeOptions & options)
   auto durable_qos = rclcpp::QoS(10).reliable().transient_local();
   target_pub_            = create_publisher<std_msgs::msg::Float32MultiArray>("/target_position", durable_qos);
   active_controller_pub_ = create_publisher<std_msgs::msg::UInt8>("/active_controller", durable_qos);
+  // uart_to_stm32 的速度转发门控：收到合法 /route_choice(1/2/3) 才会把 /target_velocity 下发飞控
+  route_choice_pub_      = create_publisher<std_msgs::msg::UInt8>("/route_choice", durable_qos);
   // 激光复用电磁铁链路（同 STM32 GPIO，0x33 帧）：1=开, 0=关
   electromagnet_pub_     = create_publisher<std_msgs::msg::UInt8>("/electromagnet_control", durable_qos);
   led_digit_pub_         = create_publisher<std_msgs::msg::UInt8>("/led_digit", rclcpp::QoS(10).reliable());
+  // 柱子检测窗使能：边沿触发 tf 检测器（true 清零开收 / false 聚类发布）。
+  // QoS 与检测器 enable_sub_ 对齐：transient_local 防关窗那一下漏接。
+  pillar_detect_enable_pub_ = create_publisher<std_msgs::msg::Bool>(
+    "/pillar_detect_enable", rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
   mission_complete_pub_  = create_publisher<std_msgs::msg::Empty>("/mission_complete", rclcpp::QoS(10).reliable());
 
   height_sub_ = create_subscription<std_msgs::msg::Int16>(
@@ -86,8 +98,10 @@ SprayMissionNode::SprayMissionNode(const rclcpp::NodeOptions & options)
     "/barcode_text", rclcpp::QoS(10),
     std::bind(&SprayMissionNode::barcodeTextCallback, this, std::placeholders::_1));
 
+  // tf 版检测器输出 /detected_pillars（按票数降序的多杆 x,y 对），关窗后只发一次。
+  const std::string pillar_topic = declare_parameter<std::string>("pillar_topic", "/detected_pillars");
   pillar_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
-    "/detected_pillar",
+    pillar_topic,
     rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable(),
     std::bind(&SprayMissionNode::pillarCallback, this, std::placeholders::_1));
 
@@ -112,6 +126,13 @@ void SprayMissionNode::heightCallback(const std_msgs::msg::Int16::SharedPtr msg)
   std::lock_guard<std::mutex> lock(mutex_);
   current_height_cm_ = static_cast<double>(msg->data);
   has_height_ = true;
+  if (current_height_cm_ >= 50.0) has_been_airborne_ = true;
+  // 下降过程中高度 < 10cm 时发 LED，让裁判看到（排除起飞前地面状态）
+  if (!led_digit_sent_ && barcode_number_ > 0 &&
+      has_been_airborne_ && current_height_cm_ < 10.0) {
+    publishLedDigit(static_cast<uint8_t>(barcode_number_ % 10));
+    led_digit_sent_ = true;
+  }
 }
 
 void SprayMissionNode::sprayAllowedCallback(const std_msgs::msg::Bool::SharedPtr msg)
@@ -136,19 +157,25 @@ void SprayMissionNode::barcodeTextCallback(const std_msgs::msg::String::SharedPt
 void SprayMissionNode::pillarCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!enable_barcode_task_ || pillar_inserted_) return;
+
+  // 只接受“本次检测窗关闭后”检测器发出的结果；窗口未关时收到的多是上一轮 latch 的旧值，忽略。
+  if (!pillar_window_closed_) return;
+
+  // /detected_pillars 为多杆 x,y 对、按票数降序；首个即最佳。空数据 = 窗内没攒够票，本次条码任务跳过。
   if (msg->data.size() < 2) {
-    RCLCPP_WARN(get_logger(), "/detected_pillar 数据维度不足，忽略");
+    RCLCPP_WARN(get_logger(), "/detected_pillars 为空，检测窗内未锁定柱子，跳过条码任务");
     return;
   }
   pillar_x_m_ = static_cast<double>(msg->data[0]);
   pillar_y_m_ = static_cast<double>(msg->data[1]);
   pillar_received_ = true;
-  RCLCPP_INFO(get_logger(), "收到杆塔位置：x=%.2fm y=%.2fm", pillar_x_m_, pillar_y_m_);
+  RCLCPP_INFO(get_logger(),
+    "锁定杆塔位置：x=%.2fm y=%.2fm（候选 %zu 个，取票数最高）",
+    pillar_x_m_, pillar_y_m_, msg->data.size() / 2);
 
-  if (enable_barcode_task_ && !pillar_inserted_) {
-    insertBarcodeObserveWaypoint(pillar_x_m_, pillar_y_m_);
-    pillar_inserted_ = true;
-  }
+  insertBarcodeObserveWaypoint(pillar_x_m_, pillar_y_m_);
+  pillar_inserted_ = true;
 }
 
 // ─── 航点构建 ───────────────────────────────────────────────────────────────
@@ -182,7 +209,7 @@ void SprayMissionNode::buildCoverageWaypoints()
     wp.y_cm     = blocks[i + 2];
     wp.z_cm     = z;
     wp.yaw_deg  = 0.0;
-    wp.spray    = true;
+    wp.spray    = (wp.block_id != 0);  // id=0 = 固定白格，硬编码跳过，不走颜色门控
     wp.wait_barcode = false;
     wp.tag      = "block";
     waypoints_.push_back(wp);
@@ -197,26 +224,48 @@ void SprayMissionNode::buildCoverageWaypoints()
 
 void SprayMissionNode::insertBarcodeObserveWaypoint(double pillar_x_m, double pillar_y_m)
 {
-  // 观察点 = 杆塔左侧偏移 pillar_left_offset_m_，高度对准条码段中心
-  SprayWaypoint wp;
-  wp.x_cm        = meterToCm(pillar_x_m);
-  wp.y_cm        = meterToCm(pillar_y_m + pillar_left_offset_m_);
-  wp.z_cm        = barcode_target_z_cm_;
-  wp.yaw_deg     = 0.0;
-  wp.spray       = false;
-  wp.wait_barcode = true;
-  wp.block_id    = 0;
-  wp.tag         = "barcode_observe";
-
-  // 插入到 GOTO_A 之后（idx=2 位置），保证起飞 → block_A → barcode_observe → 覆盖
-  if (waypoints_.size() >= 2) {
-    waypoints_.insert(waypoints_.begin() + 2, wp);
-    RCLCPP_INFO(get_logger(),
-      "已插入条码观察航点 idx=2：(%.1f, %.1f, %.1f)cm",
-      wp.x_cm, wp.y_cm, wp.z_cm);
-  } else {
-    waypoints_.push_back(wp);
+  // 观察点 = 杆塔外侧后撤 pillar_observe_offset_m_，让相机正对条码段中心。
+  // 后撤方向 + 机头 yaw 由二维码相机朝向 barcode_cam_axis_ 决定：
+  //   "+x"(本机,相机装正前方): 停在杆塔 -X 侧, 机头朝 +X (yaw=0)
+  //   "-x": 停在杆塔 +X 侧, yaw=180
+  //   "+y": 停在杆塔 -Y 侧, yaw=90
+  //   "-y"(朋友,相机装侧面): 停在杆塔 +Y 侧, yaw=-90  (朋友老代码 yaw 实为 0，按相机实装为准)
+  const double d = pillar_observe_offset_m_;
+  double ox = 0.0, oy = 0.0, yaw = 0.0;
+  if (barcode_cam_axis_ == "+x")      { ox = -d; oy =  0; yaw =   0.0; }
+  else if (barcode_cam_axis_ == "-x") { ox =  d; oy =  0; yaw = 180.0; }
+  else if (barcode_cam_axis_ == "+y") { ox =  0; oy = -d; yaw =  90.0; }
+  else if (barcode_cam_axis_ == "-y") { ox =  0; oy =  d; yaw = -90.0; }
+  else {
+    RCLCPP_WARN(get_logger(), "未知 barcode_cam_axis=%s，按 +x 处理",
+                barcode_cam_axis_.c_str());
+    ox = -d; oy = 0; yaw = 0.0;
   }
+
+  const double tx = meterToCm(pillar_x_m + ox);
+  const double ty = meterToCm(pillar_y_m + oy);
+
+  // 巡航高直接读码：水平飞到观察点悬停等 barcode_text，不下降。两段航点：
+  //   barcode_approach (巡航高飞过去) → barcode_observe (同高悬停读)
+  SprayWaypoint approach{tx, ty, flight_height_cm_, yaw, false, false, 0, "barcode_approach"};
+  SprayWaypoint observe {tx, ty, flight_height_cm_, yaw, false, true,  0, "barcode_observe"};
+
+  // 插到 "return" 航点之前
+  std::size_t ret_idx = waypoints_.size();
+  for (std::size_t i = 0; i < waypoints_.size(); ++i) {
+    if (waypoints_[i].tag && std::string(waypoints_[i].tag) == "return") {
+      ret_idx = i;
+      break;
+    }
+  }
+  if (ret_idx <= current_idx_) {
+    RCLCPP_WARN(get_logger(), "已越过返航点，放弃插入条码观察航点");
+    return;
+  }
+  waypoints_.insert(waypoints_.begin() + ret_idx, {approach, observe});
+  RCLCPP_INFO(get_logger(),
+    "已在返航前(idx=%zu)插入条码观察两段：接近/观察 @ (%.1f, %.1f)cm, 高度 %.1fcm, yaw %.1f",
+    ret_idx, tx, ty, flight_height_cm_, yaw);
 }
 
 // ─── tf / 到达判定 ─────────────────────────────────────────────────────────
@@ -255,6 +304,12 @@ void SprayMissionNode::publishTarget(const SprayWaypoint & wp)
   std_msgs::msg::UInt8 active_msg;
   active_msg.data = 2;
   active_controller_pub_->publish(active_msg);
+
+  // 打开 uart_to_stm32 的速度转发门：发合法 /route_choice(=1)，否则 /target_velocity 会被全部丢弃，飞机不起飞。
+  // 反复发无副作用（uart 端门已开时仅 throttle 日志），可覆盖 uart 节点重连。
+  std_msgs::msg::UInt8 route_msg;
+  route_msg.data = 1;
+  route_choice_pub_->publish(route_msg);
 }
 
 void SprayMissionNode::publishLaser(bool on)
@@ -272,6 +327,40 @@ void SprayMissionNode::publishLedDigit(uint8_t digit)
   msg.data = digit;
   led_digit_pub_->publish(msg);
   RCLCPP_INFO(get_logger(), "/led_digit 发布数字 %u", static_cast<unsigned>(digit));
+}
+
+void SprayMissionNode::publishPillarDetectEnable(bool on)
+{
+  std_msgs::msg::Bool msg;
+  msg.data = on;
+  pillar_detect_enable_pub_->publish(msg);
+}
+
+// 起飞后开/关柱子检测窗。tf 检测器在窗内用 map 系 ROI 持续攒帧（无人机飞/转都不影响），
+// 关窗即聚类发布 /detected_pillars。窗时长 = 上限，不会“判太久”。
+void SprayMissionNode::managePillarDetectWindow()
+{
+  if (!enable_barcode_task_) return;
+  if (pillar_inserted_) return;       // 已锁定并插入观察航点，收工
+  if (!first_publish_done_) return;   // 起飞指令已发出（airborne）才开窗
+
+  const rclcpp::Time now = this->now();
+
+  if (!pillar_window_opened_) {
+    publishPillarDetectEnable(true);  // 清零开收
+    pillar_window_opened_ = true;
+    pillar_window_start_time_ = now;
+    RCLCPP_INFO(get_logger(),
+      "起飞后开启柱子检测窗 %.1fs（边飞边判，map 系 ROI）…", pillar_detect_window_sec_);
+    return;
+  }
+
+  if (!pillar_window_closed_ &&
+      (now - pillar_window_start_time_).seconds() >= pillar_detect_window_sec_) {
+    publishPillarDetectEnable(false);  // 关窗 → 检测器聚类发布 /detected_pillars
+    pillar_window_closed_ = true;
+    RCLCPP_INFO(get_logger(), "柱子检测窗结束，等待 /detected_pillars 锁定…");
+  }
 }
 
 // ─── 撒药子状态机（颜色门控） ───────────────────────────────────────────
@@ -379,13 +468,14 @@ bool SprayMissionNode::runBarcodeObserve()
   if (!barcode_observe_active_) {
     barcode_observe_active_ = true;
     barcode_observe_start_time_ = now;
-    barcode_detected_ = false;
-    RCLCPP_INFO(get_logger(), "到达条码观察点，悬停等 /barcode_text");
+    // 若 approach 飞行途中已识别到条码，不清空结果，直接在下一判断成功退出
+    if (barcode_number_ <= 0) barcode_detected_ = false;
+    RCLCPP_INFO(get_logger(), "到达条码观察点，悬停等 /barcode_text%s",
+      barcode_number_ > 0 ? "（approach 已识别，直接确认）" : "");
     return false;
   }
 
   if (barcode_detected_ && barcode_number_ > 0) {
-    publishLedDigit(static_cast<uint8_t>(barcode_number_ % 10));  // 默认显示个位
     barcode_observe_active_ = false;
     return true;
   }
@@ -507,12 +597,8 @@ void SprayMissionNode::monitorTimerCallback()
   if (phase_ == MissionPhase::DONE) return;
   if (!has_height_) return;
 
-  // 如果开了条码任务但还没收到杆塔位置，先等一会儿再起飞
-  if (enable_barcode_task_ && !pillar_received_ && !first_publish_done_) {
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-      "等待 /detected_pillar 后再起飞…");
-    return;
-  }
+  // 条码任务：不再起飞前死等。先起飞，起飞后开检测窗边飞边判，关窗锁定 → pillarCallback 插观察航点。
+  managePillarDetectWindow();
 
   double x, y, yaw;
   if (!getCurrentPose(x, y, yaw)) return;

@@ -6,6 +6,11 @@
   <description>TODO: Package description</description>
   <maintainer email="ubuntu@todo.todo">ubuntu</maintainer>
   <license>Apache-2.0</license>
+  <exec_depend>drone_camera_pkg</exec_depend>
+  <exec_depend>my_carto_pkg</exec_depend>
+  <exec_depend>pid_control_pkg</exec_depend>
+  <exec_depend>spray_control_pkg</exec_depend>
+  <exec_depend>uart_to_stm32</exec_depend>
   <exec_depend>visual_pkg</exec_depend>
 
   <test_depend>ament_copyright</test_depend>

@@ -68,6 +68,11 @@ private:
 
   double tf_timeout_sec_;
 
+  // 调参用：每帧把"落进 bbox 的 map 系原始点"额外发一份，供录包后离线重调聚类参数。
+  // 纯旁路，不参与检测；只在 enabled_(检测窗内)的帧才有数据，体积极小。
+  bool        publish_debug_points_;
+  std::string debug_points_topic_;
+
   // ── 状态 ──────────────────────────────────────────────────
   bool enabled_;
   bool result_published_;
@@ -81,6 +86,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr         enable_sub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pillars_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr debug_points_pub_;  // 旁路调参用
 };
 
 }  // namespace pillar_detector_pkg
