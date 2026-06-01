@@ -369,7 +369,7 @@ void SprayMissionNode::managePillarDetectWindow()
 //   到 spray 航点
 //   → 等下一帧 /spray_allowed（不同于 spray_start_time_ 之前的旧帧）
 //   → 采 3 帧 → 任一为 true 视作见绿
-//     ├ 见绿：发激光开 → 0.3s 关 → 0.3s 开 → 0.3s 关，闪 2 次后 advance
+//     ├ 见绿：发激光开 → 0.3s 关，闪 1 次后 advance
 //     ├ 3 帧全灰：跳过本格不撒（应对发挥(1) 灰格）
 //     └ 1.5s 仍未采够 3 帧：判超时跳过
 bool SprayMissionNode::runSprayWithColorGate()
@@ -387,18 +387,10 @@ bool SprayMissionNode::runSprayWithColorGate()
     return false;
   }
 
-  // 已在闪烁中：按 on/off 时间推进
+  // 已在闪烁中：按 on/off 时间推进（闪 1 次：开 on_sec → 关 → 完成）
   if (spray_blink_step_ >= 0) {
     const double dt = (now - spray_blink_edge_time_).seconds();
     if (spray_blink_step_ == 0 && dt >= spray_on_sec_) {
-      publishLaser(false);
-      spray_blink_step_ = 1;
-      spray_blink_edge_time_ = now;
-    } else if (spray_blink_step_ == 1 && dt >= spray_off_sec_) {
-      publishLaser(true);
-      spray_blink_step_ = 2;
-      spray_blink_edge_time_ = now;
-    } else if (spray_blink_step_ == 2 && dt >= spray_on_sec_) {
       publishLaser(false);
       spray_active_ = false;
       spray_blink_step_ = -1;
@@ -448,8 +440,8 @@ bool SprayMissionNode::runSprayWithColorGate()
     spray_blink_step_ = 0;
     spray_blink_edge_time_ = now;
     RCLCPP_INFO(get_logger(),
-      "航点 %zu 见绿 → 开始闪 2 次（on %.1fs / off %.1fs）",
-      current_idx_, spray_on_sec_, spray_off_sec_);
+      "航点 %zu 见绿 → 开始闪 1 次（on %.1fs）",
+      current_idx_, spray_on_sec_);
     return false;
   }
 
