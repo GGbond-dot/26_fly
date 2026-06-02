@@ -2,13 +2,14 @@
 """
 D题 立体货架盘点 — 任务总启动（单相机方案）
 
-拉起三部分：
-  1) qr_vision        单相机二维码识别 + 激光指示（/qr_vision/*）
-  2) qr_fine_tune     归一化偏移 → 机体系 cm 微调量（/qr_vision/fine_offset_body_cm）
-  3) inventory_mission_node  盘点任务状态机（遍历 / 定向）
+拉起四部分：
+  1) qr_vision           单相机二维码识别 + 激光指示（/qr_vision/*）
+  2) standoff_estimator  雷达 /scan 测板面距离（/standoff/distance），喂 qr_fine_tune 动态增益
+  3) qr_fine_tune        归一化偏移 → 机体系 cm 微调量（/qr_vision/fine_offset_body_cm）
+  4) inventory_mission_node  盘点任务状态机（遍历 / 定向）
 
 不含 PID / uart / cartographer —— 那些复用本仓现有 launch（与搬运/植保同款），
-实飞时与本 launch 一起起。
+实飞时与本 launch 一起起（standoff 需要 /scan，由 cartographer/雷达那条 launch 提供）。
 
 常用：
   ros2 launch inventory_control_pkg inventory_mission.launch.py            # 遍历盘点
@@ -50,6 +51,17 @@ def generate_launch_description() -> LaunchDescription:
             }],
         ),
         Node(
+            package="standoff_estimator_pkg",
+            executable="standoff_estimator_node",
+            name="standoff_estimator",
+            output="screen",
+            parameters=[{
+                "scan_topic": "/scan",
+                "sector_center_deg": 0.0,       # 相机/雷达同朝正前方
+                "sector_half_width_deg": 30.0,
+            }],
+        ),
+        Node(
             package="qr_vision_pkg",
             executable="qr_fine_tune",
             name="qr_fine_tune_node",
@@ -57,6 +69,11 @@ def generate_launch_description() -> LaunchDescription:
             parameters=[{
                 "input_prefix": "/qr_vision",
                 "output_topic": "/qr_vision/fine_offset_body_cm",
+                "use_standoff": True,
+                "standoff_topic": "/standoff/distance",
+                "standoff_valid_topic": "/standoff/valid",
+                "hfov_deg": 60.0,               # ⚠ 待标定相机实际视场角
+                "vfov_deg": 37.0,               # ⚠ 待标定
             }],
         ),
         Node(

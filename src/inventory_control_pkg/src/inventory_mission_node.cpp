@@ -1,6 +1,7 @@
 #include "inventory_control_pkg/inventory_mission_node.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 
 #include <tf2/utils.h>
@@ -19,6 +20,7 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   has_qr_id_(false),
   target_identified_(false),
   target_cargo_id_(0),
+  has_target_slot_(false),
   has_height_(false),
   current_height_cm_(0.0),
   mission_complete_sent_(false),
@@ -73,6 +75,10 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   qr_aligned_sub_ = create_subscription<std_msgs::msg::Bool>(
     "/qr_vision/aligned", 10,
     std::bind(&InventoryMissionNode::qrAlignedCallback, this, std::placeholders::_1));
+  // 要求2：地面站查表后下发目标货位（"A1".."D6"），飞机据此直飞
+  target_slot_sub_ = create_subscription<std_msgs::msg::String>(
+    "/inventory_target_slot", 10,
+    std::bind(&InventoryMissionNode::targetSlotCallback, this, std::placeholders::_1));
 
   // ── tf ──
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
@@ -117,6 +123,21 @@ void InventoryMissionNode::qrAlignedCallback(const std_msgs::msg::Bool::SharedPt
 {
   std::lock_guard<std::mutex> lk(mutex_);
   scan_qr_aligned_ = msg->data;
+}
+
+void InventoryMissionNode::targetSlotCallback(const std_msgs::msg::String::SharedPtr msg)
+{
+  // 地面站下发的货位字符串（"A1".."D6"）。只取首字母+数字，容忍前后空白。
+  std::string s;
+  for (char c : msg->data) {
+    if (!std::isspace(static_cast<unsigned char>(c))) s += c;
+  }
+  if (s.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lk(mutex_);
+  target_slot_ = s;
+  has_target_slot_ = true;
 }
 
 // ───────────────────────────── 主循环
@@ -230,37 +251,85 @@ bool InventoryMissionNode::runScanAtWaypoint()
 // ───────────────────────────── DIRECTED：地面识别抽取码
 bool InventoryMissionNode::runIdentifyTarget()
 {
-  if (target_identified_) {
-    return true;
-  }
-  publishQrEnable(true);  // 起飞前开识别，对着手持的抽取码
+  // 第一步：地面识别"抽取的那张码"，拿到编号后报送地面站（要求2-1）。
+  if (!target_identified_) {
+    publishQrEnable(true);  // 起飞前开识别，对着手持的抽取码
 
-  bool has_id; std::string id;
-  { std::lock_guard<std::mutex> lk(mutex_); has_id = has_qr_id_; id = latest_qr_id_; }
-  if (!has_id) {
+    bool has_id; std::string id;
+    { std::lock_guard<std::mutex> lk(mutex_); has_id = has_qr_id_; id = latest_qr_id_; }
+    if (!has_id) {
+      return false;
+    }
+
+    target_cargo_id_ = parseCargoId(id);
+    std_msgs::msg::String t;
+    t.data = std::to_string(target_cargo_id_);   // 报送编号给地面站
+    inventory_target_pub_->publish(t);
+
+    publishQrEnable(false);
+    target_identified_ = true;
+    RCLCPP_INFO(get_logger(),
+      "抽取码编号 %d 已报送地面站，等待地面站查表下发货位…", target_cargo_id_);
     return false;
   }
 
-  target_cargo_id_ = parseCargoId(id);
-  // TODO(标定)：编号→货位 的映射在比赛时未知（二维码随机张贴），
-  // 题目要求2 只要求"飞到目标货物"。可行做法：
-  //   1) 先飞要求1 的遍历建好 inventory_ 表（编号→货位），DIRECTED 时查表得 slot；
-  //   2) 或 DIRECTED 单独飞一条"边飞边读"的航线，读到匹配编号即盘点降落。
-  // 这里先用查表，查不到则退化为遍历式搜索（见 buildDirectedWaypoints）。
-  target_slot_.clear();
-  for (const auto & kv : inventory_) {
-    if (kv.second == target_cargo_id_) { target_slot_ = kv.first; break; }
+  // 第二步：等地面站把"编号→货位"查好后下发货位（地面站权威，二维码位置固定，
+  // 飞机只需货位字符串，细微偏差由相机微调）。收到货位即可规划直飞航线。
+  bool ready; std::string slot;
+  { std::lock_guard<std::mutex> lk(mutex_); ready = has_target_slot_; slot = target_slot_; }
+  if (!ready) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+      "已报送编号 %d，等待地面站下发目标货位（/inventory_target_slot）…", target_cargo_id_);
+    return false;
   }
 
+  // 把"编号→货位"的最终结果再报一次给地面站（要求2-2 画航线图用）。
   std_msgs::msg::String t;
-  t.data = "目标编号=" + std::to_string(target_cargo_id_) +
-           (target_slot_.empty() ? ",货位=未知(搜索)" : ",货位=" + target_slot_);
+  t.data = "目标编号=" + std::to_string(target_cargo_id_) + ",货位=" + slot;
   inventory_target_pub_->publish(t);
-
-  publishQrEnable(false);
-  target_identified_ = true;
-  RCLCPP_INFO(get_logger(), "抽取码识别完成：%s", t.data.c_str());
+  RCLCPP_INFO(get_logger(), "地面站下发目标货位 %s（编号 %d），规划直飞航线。",
+              slot.c_str(), target_cargo_id_);
   return true;
+}
+
+// ───────────────────────────── 货位 → 航点（遍历/定向共用，保证一致）
+InventoryWaypoint InventoryMissionNode::slotToScanWaypoint(const std::string & slot) const
+{
+  // slot = 面字符(A/B/C/D) + 货位号(1..6)，如 "C5"。
+  const char face = slot.empty() ? 'A' : slot[0];
+  int idx = 1;
+  try { idx = std::stoi(slot.substr(1)); } catch (...) { idx = 1; }
+  idx = std::max(1, std::min(6, idx));
+
+  // 面 → 货架 x / yaw / standoff 后撤方向。A/B 在货架1，C/D 在货架2；
+  // B/D 是背面，整机 yaw 转 180°，相机从货架另一侧（+x）后撤。
+  const double shelf_x   = (face == 'A' || face == 'B') ? shelf1_x_cm_ : shelf2_x_cm_;
+  const bool   back_face = (face == 'B' || face == 'D');
+  const double yaw          = back_face ? 180.0 : 0.0;
+  const double standoff_sign = back_face ? +1.0 : -1.0;
+  const double face_x = shelf_x + standoff_sign * scan_standoff_cm_;
+
+  const int row = (idx - 1) / 3;    // 0=上行(1,2,3) 1=下行(4,5,6)
+  int       col = (idx - 1) % 3;    // 0,1,2 = 正面视角 左→右
+  // 背面(B/D)相机朝向相反，列的左右在 map-y 上镜像翻转。
+  // TODO(标定)：若实测 B/D 列方向反了，去掉这行镜像即可——这是唯一的列方向开关。
+  if (back_face) col = 2 - col;
+
+  // TODO(场地标定)：y_center 为货架沿 y 方向中心、row_z 为上下行真实高度，
+  // 均需按本机 cartographer 地图原点 + 题目图2（下沿60、行间40+40）实测填写。
+  const double y_center = home_y_cm_ + 250.0;  // 占位
+  const std::array<double, 3> col_dy = {-slot_col_spacing_cm_, 0.0, slot_col_spacing_cm_};
+  const std::array<double, 2> row_z  = {flight_height_cm_, flight_height_cm_ - slot_row_spacing_cm_};
+
+  InventoryWaypoint wp;
+  wp.x_cm    = face_x;
+  wp.y_cm    = y_center + col_dy[col];
+  wp.z_cm    = row_z[row];
+  wp.yaw_deg = yaw;
+  wp.scan    = true;
+  wp.slot    = slot;
+  wp.tag     = "scan";
+  return wp;
 }
 
 // ───────────────────────────── 航线构建
@@ -272,32 +341,11 @@ void InventoryMissionNode::buildTraverseWaypoints()
   waypoints_.push_back({home_x_cm_, home_y_cm_, flight_height_cm_, 0.0,
                         false, "", "takeoff"});
 
-  // TODO(场地标定)：以下坐标全部为占位示意，需按本机 cartographer 地图坐标系
-  // 与题目 图1/图2 实测标定。当前仅给出"单相机 + yaw 换面"的航点骨架结构：
-  //   - 每个面 6 个货位 = 2 行 × 3 列；上行高 ~125cm、下行高 ~25cm（图2：40+40 间距，下沿60）
-  //   - A 面与 B 面在同一货架两侧，yaw 相差 180°；C/D 面同理在货架2。
-  //   - scan_standoff_cm_ 为相机离板面的水平后撤距离。
-  struct FaceDef { const char * face; double shelf_x; double yaw; double standoff_sign; };
-  const std::array<FaceDef, 4> faces = {{
-    {"A", shelf1_x_cm_, 0.0,   -1.0},
-    {"B", shelf1_x_cm_, 180.0, +1.0},
-    {"C", shelf2_x_cm_, 0.0,   -1.0},
-    {"D", shelf2_x_cm_, 180.0, +1.0},
-  }};
-
-  const double y_center = (home_y_cm_ + 250.0);  // 占位：货架沿 y 方向中心
-  const std::array<double, 2> row_z = {flight_height_cm_, flight_height_cm_ - slot_row_spacing_cm_};
-  const std::array<double, 3> col_dy = {-slot_col_spacing_cm_, 0.0, slot_col_spacing_cm_};
-
-  for (const auto & f : faces) {
-    const double face_x = f.shelf_x + f.standoff_sign * scan_standoff_cm_;
-    for (int row = 0; row < 2; ++row) {       // 0=上行(1,2,3) 1=下行(4,5,6)
-      for (int col = 0; col < 3; ++col) {
-        const int idx = row * 3 + col + 1;     // 1..6
-        const std::string slot = std::string(f.face) + std::to_string(idx);
-        waypoints_.push_back({face_x, y_center + col_dy[col], row_z[row], f.yaw,
-                              true, slot, "scan"});
-      }
+  // 24 个货位，顺序 A1..A6 → B1..B6 → C1..C6 → D1..D6（A→B、C→D 之间的换面
+  // 过渡航点：回实验室结合实测坐标插入，详见开发笔记 §三建议）。
+  for (const char * face : {"A", "B", "C", "D"}) {
+    for (int idx = 1; idx <= 6; ++idx) {
+      waypoints_.push_back(slotToScanWaypoint(std::string(face) + std::to_string(idx)));
     }
   }
 
@@ -312,20 +360,11 @@ void InventoryMissionNode::buildDirectedWaypoints(const std::string & target_slo
   waypoints_.push_back({home_x_cm_, home_y_cm_, flight_height_cm_, 0.0,
                         false, "", "takeoff"});
 
-  if (!target_slot.empty()) {
-    // TODO(场地标定)：由 target_slot 查面/行/列反算 (x,y,z,yaw)，直飞该货位。
-    // 占位：直接飞到货架1 A 面中心高度悬停盘点。
-    const double face_x = shelf1_x_cm_ - scan_standoff_cm_;
-    const double y_center = home_y_cm_ + 250.0;
-    waypoints_.push_back({face_x, y_center, flight_height_cm_, 0.0,
-                          true, target_slot, "scan_directed"});
-  } else {
-    RCLCPP_WARN(get_logger(),
-      "目标货位未知：需先跑遍历建表，或改用边飞边读搜索航线（见 cpp TODO）。");
-    // 占位：退化为遍历搜索
-    buildTraverseWaypoints();
-    return;
-  }
+  // 地面站已下发货位 → 用与遍历完全相同的几何映射到航点，直飞该货位盘点。
+  // （二维码位置固定，slotToScanWaypoint 给出标称坐标，细微偏差由 qr_fine_tune 微调。）
+  InventoryWaypoint scan = slotToScanWaypoint(target_slot);
+  scan.tag = "scan_directed";
+  waypoints_.push_back(scan);
 
   waypoints_.push_back({land_x_cm_, land_y_cm_, flight_height_cm_, 0.0, false, "", "return"});
   waypoints_.push_back({land_x_cm_, land_y_cm_, land_height_cm_, 0.0, false, "", "land"});

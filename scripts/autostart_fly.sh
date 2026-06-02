@@ -80,6 +80,9 @@ trap cleanup INT TERM EXIT
   source /opt/ros/humble/setup.bash
   source "$WS_ROOT/install/setup.bash"
 
+  # 跨机 DDS 环境（与地面站同 ROS_DOMAIN_ID）。只导出环境变量，不再 source ROS。
+  source "$SCRIPT_DIR/setup_dds.sh"
+
   # 视觉节点要弹预览窗 → 给 X 环境兜底
   export DISPLAY="${DISPLAY:-:0}"
   export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"

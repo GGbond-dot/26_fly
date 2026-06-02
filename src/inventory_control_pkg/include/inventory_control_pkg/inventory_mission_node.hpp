@@ -63,11 +63,13 @@ enum class MissionPhase
 //   发布 /qr_vision/enable  Bool  (到货位才 true，开识别+激光；平时 false)
 //   发布 /inventory_result  String("编号=7,货位=B3") → 地面站 LCD 实时显示
 //   发布 /inventory_led     Empty → 地面站每盘到一个货物亮灭一次 LED
-//   发布 /inventory_target  String → DIRECTED 模式报送"抽取码"的编号给地面站
+//   发布 /inventory_target  String → DIRECTED：先报送抽取码编号("7")，地面站下发货位后
+//                                    再报送"目标编号=7,货位=C5"（供地面站画航线图，要求2-2）
 //   发布 /mission_complete  Empty
 //   订阅 /height            Int16 (cm，uart_to_stm32 上报)
 //   订阅 /qr_vision/id      String (识别到的货物编号 "1".."24")
 //   订阅 /qr_vision/aligned Bool   (二维码已对准画面中心)
+//   订阅 /inventory_target_slot String → DIRECTED：地面站查"编号→货位"表后下发货位("C5")
 //   位姿通过 tf2: map → laser_link
 class InventoryMissionNode : public rclcpp::Node
 {
@@ -103,9 +105,16 @@ private:
   // 构建定向航线：起飞→直飞目标货位→盘点→返航。target_slot 由识别结果映射得到。
   void buildDirectedWaypoints(const std::string & target_slot);
 
+  // 货位（"A1".."D6"）→ 盘点航点。遍历与定向共用此函数，保证"定向直飞的点"
+  // 与"遍历记录该货位时的点"严格一致。几何来自题目 图1/图2（仍需场地标定 y_center 等）。
+  InventoryWaypoint slotToScanWaypoint(const std::string & slot) const;
+
   // 把"货物编号"映射到货位（A1..D6）。遍历盘点时由识别顺序直接得到货位；
-  // 定向盘点时若只知编号、不知货位，需要先飞一轮或靠先验表（见 cpp TODO）。
+  // 定向盘点的"编号→货位"由地面站权威下发（见 targetSlotCallback）。
   void recordInventory(const std::string & slot, int cargo_id);
+
+  // 要求2：地面站收到飞机报送的抽取码编号后，查它自己的表得出货位，下发给飞机。
+  void targetSlotCallback(const std_msgs::msg::String::SharedPtr msg);
 
   static double meterToCm(double v) { return v * 100.0; }
   double normalizeAngleDeg(double angle_deg) const;
@@ -155,9 +164,10 @@ private:
   bool          has_qr_id_;
 
   // DIRECTED 目标
-  bool          target_identified_;
+  bool          target_identified_;     // 已读到抽取码编号并报送地面站
   int           target_cargo_id_;
-  std::string   target_slot_;
+  bool          has_target_slot_;        // 地面站已下发货位
+  std::string   target_slot_;            // 地面站下发的货位（"A1".."D6"）
 
   // 盘点结果：slot → cargo_id
   std::map<std::string, int> inventory_;
@@ -175,6 +185,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr   height_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr  qr_id_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr    qr_aligned_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr  target_slot_sub_;  // 地面站下发货位
 
   rclcpp::TimerBase::SharedPtr  monitor_timer_;
 

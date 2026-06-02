@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>vl53_ranging_pkg</name>
+  <version>0.1.0</version>
+  <description>解析维特智能 VL53-100 激光测距模块串口模式的 ASCII 输出，发布距离/状态。复用 serial_comm 串口库。</description>
+
+  <maintainer email="maintainer@example.com">Your Name</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>Boost</depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>serial_comm</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>standoff_estimator_pkg</name>
+  <version>0.1.0</version>
+  <description>用 2D 激光雷达 /scan 在正前方扇区拟合货架板面，输出飞机到板面的垂直距离(standoff)，供视觉做像素->真实cm换算。</description>
+
+  <maintainer email="maintainer@example.com">Your Name</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
