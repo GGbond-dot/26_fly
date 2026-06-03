@@ -127,6 +127,10 @@ private:
   std::string mode_str_;              // "traverse" / "directed"
   MissionMode mode_;
 
+  // 遍历哪些面（逗号分隔，如 "A,B,C,D" 全跑；"A,B" 只跑货架1，第二货架未到时用）。
+  std::string traverse_faces_str_;
+  std::vector<std::string> traverse_faces_;
+
   double pos_tol_cm_;
   double yaw_tol_deg_;
   double height_tol_cm_;

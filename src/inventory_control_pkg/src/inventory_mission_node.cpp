@@ -34,6 +34,21 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   mode_ = (mode_str_ == "directed") ? MissionMode::DIRECTED : MissionMode::TRAVERSE;
   active_mode_ = mode_;
 
+  // 遍历哪些面：默认四面全跑；只有货架1时设 "A,B" 即可只扫前后两面，不会飞向货架2。
+  traverse_faces_str_ = declare_parameter<std::string>("traverse_faces", "A,B,C,D");
+  {
+    std::string tok;
+    for (char c : traverse_faces_str_) {
+      if (c == ',') {
+        if (!tok.empty()) { traverse_faces_.push_back(tok); tok.clear(); }
+      } else if (!std::isspace(static_cast<unsigned char>(c))) {
+        tok += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      }
+    }
+    if (!tok.empty()) traverse_faces_.push_back(tok);
+    if (traverse_faces_.empty()) traverse_faces_ = {"A", "B", "C", "D"};
+  }
+
   pos_tol_cm_    = declare_parameter<double>("pos_tol_cm", 12.0);
   yaw_tol_deg_   = declare_parameter<double>("yaw_tol_deg", 8.0);
   height_tol_cm_ = declare_parameter<double>("height_tol_cm", 15.0);
@@ -341,11 +356,12 @@ void InventoryMissionNode::buildTraverseWaypoints()
   waypoints_.push_back({home_x_cm_, home_y_cm_, flight_height_cm_, 0.0,
                         false, "", "takeoff"});
 
-  // 24 个货位，顺序 A1..A6 → B1..B6 → C1..C6 → D1..D6（A→B、C→D 之间的换面
-  // 过渡航点：回实验室结合实测坐标插入，详见开发笔记 §三建议）。
-  for (const char * face : {"A", "B", "C", "D"}) {
+  // 按 traverse_faces_ 顺序逐面盘点（默认 A→B→C→D；只有货架1时传 "A,B"）。
+  // 同面 6 个货位 1..6（A→B、C→D 之间的换面过渡航点：回实验室结合实测坐标插入，
+  // 详见开发笔记 §三建议）。
+  for (const std::string & face : traverse_faces_) {
     for (int idx = 1; idx <= 6; ++idx) {
-      waypoints_.push_back(slotToScanWaypoint(std::string(face) + std::to_string(idx)));
+      waypoints_.push_back(slotToScanWaypoint(face + std::to_string(idx)));
     }
   }
 

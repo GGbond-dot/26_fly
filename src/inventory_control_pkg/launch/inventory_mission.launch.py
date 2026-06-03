@@ -24,6 +24,7 @@ from launch_ros.actions import Node
 
 def generate_launch_description() -> LaunchDescription:
     mode = LaunchConfiguration("mode")
+    traverse_faces = LaunchConfiguration("traverse_faces")
     camera_device = LaunchConfiguration("camera_device")
     laser_pin = LaunchConfiguration("laser_pin")
     rotate_code = LaunchConfiguration("rotate_code")
@@ -31,6 +32,8 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         DeclareLaunchArgument("mode", default_value="traverse",
                               description="traverse=遍历盘点 / directed=定向盘点"),
+        DeclareLaunchArgument("traverse_faces", default_value="A,B,C,D",
+                              description="遍历哪些面（逗号分隔）。只有货架1时设 A,B 只扫前后两面"),
         DeclareLaunchArgument("camera_device", default_value="/dev/video0",
                               description="盘点相机设备（按 by-path 稳定路径配置更稳）"),
         DeclareLaunchArgument("laser_pin", default_value="-1",
@@ -83,6 +86,7 @@ def generate_launch_description() -> LaunchDescription:
             output="screen",
             parameters=[{
                 "mode": mode,
+                "traverse_faces": traverse_faces,
                 "flight_height_cm": 150.0,
             }],
         ),
