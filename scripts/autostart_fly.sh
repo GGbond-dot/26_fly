@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# G 题植保飞行器 — 开机自启脚本
+# D 题立体货架盘点 — 开机自启脚本
 #
 # 由 systemd / rc.local / 桌面自启项在开机后调用。做三件事：
 #   1) 等系统起来（网络/串口/相机枚举完成）
 #   2) source ROS humble + 本工作空间 install
-#   3) 用 run_test.sh 的同款套路启动 spray_basic.launch.py：
+#   3) 用 run_test.sh 的同款套路启动盘点 launch：
 #        - 控制台输出 tee 到带时间戳日志（状态机叙事）
 #        - 关键话题录 rosbag（事后回放/画曲线）
 #        - 收到停止信号时让 bag 正常写完 metadata
 #
-# 想换 launch（如只联调 LED）：AUTOSTART_LAUNCH=led_digit_test.launch.py ./autostart_fly.sh
+# 默认起「QR→激光」链路测试（qr_vision + uart_to_stm32，复用植保 /electromagnet_control 链路）。
+# 想换 launch / 包：
+#   AUTOSTART_PKG=inventory_control_pkg AUTOSTART_LAUNCH=inventory_mission.launch.py ./autostart_fly.sh
 #
 # 产物（默认 ~/fly_logs/）：
 #   autostart_<时间戳>.log   开机自启外层日志（含 source/环境信息）
@@ -29,22 +31,22 @@ mkdir -p "$LOG_DIR"
 TS="$(date +%Y%m%d_%H%M%S)"
 AUTO_LOG="$LOG_DIR/autostart_${TS}.log"
 
-LAUNCH_PKG="my_launch"
-LAUNCH_FILE="${AUTOSTART_LAUNCH:-spray_basic.launch.py}"
+LAUNCH_PKG="${AUTOSTART_PKG:-inventory_control_pkg}"
+LAUNCH_FILE="${AUTOSTART_LAUNCH:-qr_laser_test.launch.py}"
 
-# ---- 要录的话题（G 题 spray 数值排查用，见开发笔记 §5）----
+# ---- 要录的话题（D 题盘点排查用，见开发笔记）----
 TOPICS=(
+  /qr_vision/id            # 识别到的二维码编号 "1".."24"
+  /qr_vision/offset_norm   # 归一化像素偏移 x=ex(右正)/y=ey(下正)
+  /qr_vision/aligned       # 是否已对准中心（激光改香橙派 GPIO 直驱，不在话题上）
+  /qr_vision/enable        # 识别+激光总开关（mission 到位才开）
+  /inventory_result        # 逐货位上报 编号=N,货位=XY（建表/LCD）
+  /inventory_led           # 每盘一个 LED 亮灭
+  /inventory_target        # 定向盘点抽取码编号/确认
+  /inventory_target_slot   # 地面站下发货位 "C5"
+  /standoff/distance       # 雷达测板面距离 cm（standoff 闭环）
   /height                  # STM32 上报离地高度 cm（z 反馈）
   /target_position         # mission 下发目标点 [x,y,z,yaw]
-  /target_velocity         # 位置 PID 输出速度
-  /active_controller       # 控制器接管状态
-  /electromagnet_control   # 激光开关（复用电磁铁链路 0x33）
-  /led_digit               # 条码数字 LED 闪烁帧
-  /spray_allowed           # 下视见绿门控
-  /barcode_text            # Code128 识别结果
-  /pillar_detect_enable    # 柱子检测窗开/关（起飞后空中识别）
-  /detected_pillars        # tf 版多杆 xy（按票数降序，取首个=最佳）
-  /pillar_debug_points     # 检测窗内落进 bbox 的 map 系原始点（取代整段 /scan，离线重调聚类参数用）
   /mission_step            # STM32 回传任务步
 )
 
@@ -69,7 +71,7 @@ trap cleanup INT TERM EXIT
   echo "[autostart] ws=$WS_ROOT"
   echo "[autostart] DISPLAY=${DISPLAY:-}"
 
-  # 等外设枚举（串口 / 下视相机 /dev/video2）。不够再加大。
+  # 等外设枚举（串口 / 盘点用下视相机 /dev/video0）。不够再加大。
   sleep 8
   echo "[autostart] after sleep at $(date)"
 

@@ -34,12 +34,16 @@ def generate_launch_description() -> LaunchDescription:
                               description="traverse=遍历盘点 / directed=定向盘点"),
         DeclareLaunchArgument("traverse_faces", default_value="A,B,C,D",
                               description="遍历哪些面（逗号分隔）。只有货架1时设 A,B 只扫前后两面"),
-        DeclareLaunchArgument("camera_device", default_value="/dev/video0",
-                              description="盘点相机设备（按 by-path 稳定路径配置更稳）"),
-        DeclareLaunchArgument("laser_pin", default_value="-1",
-                              description="激光 wiringPi 引脚号，-1=不控（无硬件调试）"),
-        DeclareLaunchArgument("rotate_code", default_value="-1",
-                              description="相机旋转 -1/0/1/2，按当前安装方位标定"),
+        # 盘点相机 = 之前植保的下视相机 down_cam(/dev/video0)。by-path 稳定路径，插拔不变号。
+        DeclareLaunchArgument(
+            "camera_device",
+            default_value="/dev/v4l/by-path/platform-xhci-hcd.11.auto-usb-0:1:1.0-video-index0",
+            description="盘点相机设备（下视 down_cam by-path 稳定路径）"),
+        # 激光走香橙派 WiringOP `gpio` 命令控脚（实测 pin=13，on=低）。植保 /electromagnet_control(0x33) 实测不稳，已弃用。
+        DeclareLaunchArgument("laser_pin", default_value="13",
+                              description="激光 WiringOP 引脚号（香橙派 gpio 命令，实测=13），-1=不控"),
+        DeclareLaunchArgument("rotate_code", default_value="2",
+                              description="相机旋转 -1/0/1/2，下视相机画面逆时针90°转正=2"),
 
         Node(
             package="qr_vision_pkg",
