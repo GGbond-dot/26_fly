@@ -10,12 +10,14 @@ from typing import Any
 os.environ.setdefault("QT_XCB_GL_INTEGRATION", "none")
 os.environ.setdefault("QT_OPENGL", "software")
 
-from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
+from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QIntValidator, QPainter, QPen
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -52,6 +54,140 @@ else:
         waypoint_map,
     )
     from .ros_bridge import RosBridge
+
+
+class TouchLineEdit(QLineEdit):
+    """触摸屏用：只读输入框，点一下发 clicked 信号弹数字键盘（不依赖系统输入法）。"""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # 只读：避免触屏点击时系统去找虚拟键盘/输入法，输入全靠弹出的数字键盘。
+        self.setReadOnly(True)
+        self.setFocusPolicy(Qt.NoFocus)
+
+    def mousePressEvent(self, event: Any) -> None:  # noqa: N802 (Qt 命名)
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class NumericKeypad(QDialog):
+    """悬浮数字键盘弹窗：输入 1~24 的货物编号。触摸友好，大按钮。
+
+    用法：value = NumericKeypad.get_value(parent, initial="7")
+          返回确认后的字符串；点取消返回 None。
+    """
+
+    def __init__(self, parent: QWidget | None = None, initial: str = "") -> None:
+        super().__init__(parent)
+        self.setObjectName("keypadDialog")
+        self.setWindowTitle("输入货物编号")
+        self.setModal(True)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self._value = "".join(ch for ch in initial if ch.isdigit())
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 18, 18, 18)
+        outer.setSpacing(14)
+
+        title = QLabel("输入货物编号 (1-24)")
+        title.setObjectName("keypadTitle")
+        title.setAlignment(Qt.AlignCenter)
+        outer.addWidget(title)
+
+        self.display = QLabel()
+        self.display.setObjectName("keypadDisplay")
+        self.display.setAlignment(Qt.AlignCenter)
+        self.display.setMinimumHeight(70)
+        outer.addWidget(self.display)
+
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        keys = [
+            ("1", 0, 0), ("2", 0, 1), ("3", 0, 2),
+            ("4", 1, 0), ("5", 1, 1), ("6", 1, 2),
+            ("7", 2, 0), ("8", 2, 1), ("9", 2, 2),
+            ("←", 3, 0), ("0", 3, 1), ("清", 3, 2),
+        ]
+        for text, row, col in keys:
+            btn = QPushButton(text)
+            btn.setObjectName("keypadButton")
+            btn.setMinimumSize(96, 84)
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.clicked.connect(lambda _checked, t=text: self._on_key(t))
+            grid.addWidget(btn, row, col)
+        outer.addLayout(grid)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(12)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("keypadCancel")
+        cancel_btn.setMinimumHeight(72)
+        cancel_btn.setFocusPolicy(Qt.NoFocus)
+        cancel_btn.clicked.connect(self.reject)
+        ok_btn = QPushButton("确定")
+        ok_btn.setObjectName("keypadOk")
+        ok_btn.setMinimumHeight(72)
+        ok_btn.setFocusPolicy(Qt.NoFocus)
+        ok_btn.clicked.connect(self._on_confirm)
+        actions.addWidget(cancel_btn)
+        actions.addWidget(ok_btn)
+        outer.addLayout(actions)
+
+        self.setStyleSheet(KEYPAD_STYLE)
+        self._refresh()
+
+    def _on_key(self, text: str) -> None:
+        if text == "←":
+            self._value = self._value[:-1]
+        elif text == "清":
+            self._value = ""
+        else:  # 数字；最多 2 位（24 是上限）
+            if len(self._value) < 2:
+                self._value += text
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.display.setText(self._value if self._value else "—")
+        valid = self._value.isdigit() and 1 <= int(self._value) <= 24
+        # 非法（空 / 超 1-24）时显示红字提示，确定也不放行
+        self.display.setProperty("invalid", "true" if (self._value and not valid) else "false")
+        self.display.style().unpolish(self.display)
+        self.display.style().polish(self.display)
+
+    def _on_confirm(self) -> None:
+        if self._value.isdigit() and 1 <= int(self._value) <= 24:
+            self.accept()
+        else:
+            # 给个明显的非法反馈
+            self.display.setText("请输入 1-24")
+            self.display.setProperty("invalid", "true")
+            self.display.style().unpolish(self.display)
+            self.display.style().polish(self.display)
+
+    def value(self) -> str:
+        return self._value
+
+    def showEvent(self, event: Any) -> None:  # noqa: N802 (Qt 命名)
+        # 无边框弹窗默认可能落在角落，居中到父窗口（无父则居中到屏幕）。
+        super().showEvent(event)
+        self.adjustSize()
+        parent = self.parentWidget()
+        if parent is not None:
+            ref = parent.window().frameGeometry()
+        else:
+            ref = QApplication.primaryScreen().availableGeometry()
+        geo = self.frameGeometry()
+        geo.moveCenter(ref.center())
+        self.move(geo.topLeft())
+
+    @staticmethod
+    def get_value(parent: QWidget | None, initial: str = "") -> str | None:
+        dlg = NumericKeypad(parent, initial)
+        if dlg.exec_() == QDialog.Accepted:
+            return dlg.value()
+        return None
 
 
 class WarehouseMap(QWidget):
@@ -334,12 +470,12 @@ class GroundStationWindow(QMainWindow):
         self.led_indicator = QLabel("LED")
         self.led_indicator.setObjectName("ledIndicator")
         self.led_indicator.setAlignment(Qt.AlignCenter)
-        self.led_indicator.setFixedSize(70, 34)
+        self.led_indicator.setFixedSize(104, 52)
         top_layout.addWidget(self.led_indicator)
 
         close_button = QPushButton("×")
         close_button.setObjectName("closeButton")
-        close_button.setFixedSize(44, 38)
+        close_button.setFixedSize(56, 48)
         close_button.clicked.connect(self.close)
         top_layout.addWidget(close_button)
         root.addWidget(top_bar)
@@ -350,21 +486,23 @@ class GroundStationWindow(QMainWindow):
 
         controls_panel = QFrame()
         controls_panel.setObjectName("controlsPanel")
-        controls_panel.setMinimumWidth(210)
-        controls_panel.setMaximumWidth(260)
+        controls_panel.setMinimumWidth(300)
+        controls_panel.setMaximumWidth(380)
         controls_layout = QVBoxLayout(controls_panel)
-        controls_layout.setContentsMargins(12, 12, 12, 12)
-        controls_layout.setSpacing(10)
+        controls_layout.setContentsMargins(14, 14, 14, 14)
+        controls_layout.setSpacing(16)
 
         controls_title = QLabel("定点控制")
         controls_title.setObjectName("sectionTitle")
         controls_layout.addWidget(controls_title)
 
-        query_label = QLabel("货物编号")
-        self.query_input = QLineEdit()
-        self.query_input.setPlaceholderText("1-24")
+        query_label = QLabel("货物编号（点此弹键盘）")
+        self.query_input = TouchLineEdit()
+        self.query_input.setPlaceholderText("点击输入 1-24")
         self.query_input.setValidator(QIntValidator(1, 24, self))
-        self.query_input.returnPressed.connect(self.query_item)
+        self.query_input.setMinimumHeight(62)
+        self.query_input.setAlignment(Qt.AlignCenter)
+        self.query_input.clicked.connect(self.open_keypad)
 
         query_button = QPushButton("查询坐标")
         query_button.clicked.connect(self.query_item)
@@ -374,7 +512,9 @@ class GroundStationWindow(QMainWindow):
         clear_button.clicked.connect(self.clear_results)
 
         for button in (query_button, self.send_button, clear_button):
+            button.setObjectName("controlButton")
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setMinimumHeight(78)
 
         self.query_result_label = QLabel("输入编号后查询；收到目标编号时会自动发送 A1 这类库位信息。")
         self.query_result_label.setObjectName("queryResult")
@@ -514,6 +654,14 @@ class GroundStationWindow(QMainWindow):
         self.store.update_mission_status({"phase": "完成"})
         self.query_result_label.setText("无人机已完成本轮盘点任务。")
         self._refresh_status_labels()
+
+    def open_keypad(self) -> None:
+        # 触摸屏点输入框 → 弹悬浮数字键盘输入 1~24，确定后自动查询。
+        value = NumericKeypad.get_value(self, self.query_input.text())
+        if value is None:
+            return
+        self.query_input.setText(value)
+        self.query_item()
 
     def query_item(self) -> None:
         item_id = self._current_query_id()
@@ -683,6 +831,7 @@ STYLE_SHEET = """
     border: 1px solid #6b7785;
     border-radius: 4px;
     font-weight: 700;
+    font-size: 24px;
 }
 #ledIndicator[active="true"] {
     background: #26a65b;
@@ -702,12 +851,12 @@ QTabWidget::pane {
 QTabBar::tab {
     background: #dfe6ee;
     color: #263238;
-    padding: 10px 28px;
-    min-width: 116px;
+    padding: 14px 36px;
+    min-width: 140px;
     border: 1px solid #c3ccd6;
     border-bottom: none;
     font-weight: 700;
-    font-size: 19px;
+    font-size: 23px;
 }
 QTabBar::tab:selected {
     background: #ffffff;
@@ -750,18 +899,18 @@ QLineEdit {
     background: #ffffff;
     border: 1px solid #aeb9c5;
     border-radius: 4px;
-    padding: 8px 10px;
+    padding: 12px 14px;
     min-width: 92px;
-    font-size: 18px;
+    font-size: 26px;
 }
 QPushButton {
     background: #1976d2;
     color: #ffffff;
     border: none;
     border-radius: 4px;
-    padding: 9px 14px;
+    padding: 11px 16px;
     font-weight: 700;
-    font-size: 18px;
+    font-size: 20px;
 }
 QPushButton:hover {
     background: #1565c0;
@@ -769,12 +918,82 @@ QPushButton:hover {
 QPushButton:pressed {
     background: #0d47a1;
 }
+/* 左侧三个主操作按钮：查询坐标 / 发送库位 / 清空本轮 —— 特别放大 */
+#controlButton {
+    font-size: 28px;
+    padding: 22px 18px;
+    margin: 3px 0;
+}
 #queryResult {
     color: #263238;
     background: #f4f7fa;
     border: 1px solid #d5dce5;
     border-radius: 4px;
     padding: 8px;
+}
+"""
+
+
+# 悬浮数字键盘弹窗样式（触摸屏用，大按钮）
+KEYPAD_STYLE = """
+#keypadDialog {
+    background: #1f2a35;
+    border: 2px solid #4b6175;
+    border-radius: 10px;
+    font-family: "Noto Sans CJK SC", "Microsoft YaHei", "Sans Serif";
+}
+#keypadTitle {
+    color: #f8fbff;
+    font-size: 22px;
+    font-weight: 700;
+}
+#keypadDisplay {
+    background: #ffffff;
+    color: #18212b;
+    border: 1px solid #aeb9c5;
+    border-radius: 6px;
+    font-size: 40px;
+    font-weight: 700;
+    padding: 4px 12px;
+}
+#keypadDisplay[invalid="true"] {
+    color: #c62828;
+    border: 2px solid #ef5350;
+}
+#keypadButton {
+    background: #2e3e4e;
+    color: #ffffff;
+    border: 1px solid #4b6175;
+    border-radius: 8px;
+    font-size: 34px;
+    font-weight: 700;
+}
+#keypadButton:pressed {
+    background: #14507a;
+}
+#keypadOk {
+    background: #1976d2;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    font-size: 26px;
+    font-weight: 700;
+    padding: 0 28px;
+}
+#keypadOk:pressed {
+    background: #0d47a1;
+}
+#keypadCancel {
+    background: #5c6b7a;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    font-size: 26px;
+    font-weight: 700;
+    padding: 0 28px;
+}
+#keypadCancel:pressed {
+    background: #455563;
 }
 """
 
