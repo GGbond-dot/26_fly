@@ -34,9 +34,21 @@ PIDController::PIDController(
 {
 }
 
+double PIDController::normalizeAngleDeg(double angle_deg)
+{
+  // 归一到 (-180, 180]
+  double a = std::fmod(angle_deg + 180.0, 360.0);
+  if (a <= 0.0) {
+    a += 360.0;
+  }
+  return a - 180.0;
+}
+
 double PIDController::calculate(double setpoint, double measured_value, double dt)
 {
-  current_error_ = setpoint - measured_value;
+  // 角度通道（偏航）：误差走最短弧归一化，避免目标/当前跨 ±180° 时误差从 +179 跳到 −179。
+  current_error_ = angular_ ? normalizeAngleDeg(setpoint - measured_value)
+                            : (setpoint - measured_value);
 
   if (std::fabs(current_error_) < deadzone_) {
     current_error_ = 0.0;
@@ -57,7 +69,10 @@ double PIDController::calculate(double setpoint, double measured_value, double d
   }
   const double integral_term = ki_ * integral_;
 
-  const double derivative_raw = (dt > 0.0) ? (current_error_ - prev_error_) / dt : 0.0;
+  // 角度通道：微分增量也按最短弧归一化，否则误差跨 ±180° 跳变会让微分炸成 ~358/dt（偏航冲击）。
+  const double error_delta = angular_ ? normalizeAngleDeg(current_error_ - prev_error_)
+                                      : (current_error_ - prev_error_);
+  const double derivative_raw = (dt > 0.0) ? error_delta / dt : 0.0;
   const double derivative_filtered = derivative_filter_alpha_ * prev_derivative_ +
     (1.0 - derivative_filter_alpha_) * derivative_raw;
   const double derivative_term = kd_ * derivative_filtered;
@@ -424,6 +439,7 @@ void PositionPIDController::loadParameters()
   visual_data_timeout_sec_ = declare_parameter<double>("visual_data_timeout_sec", 0.5);
 
   pid_yaw_.setPID(kp_yaw, ki_yaw, kd_yaw);
+  pid_yaw_.setAngular(true);   // 偏航走角度模式：误差+微分都按最短弧归一化，根治跨 ±180° 跳变
   pid_z_.setPID(kp_z, ki_z, kd_z);
   pid_xy_speed_.setPID(kp_xy, ki_xy, kd_xy);
 

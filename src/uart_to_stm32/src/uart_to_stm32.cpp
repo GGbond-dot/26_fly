@@ -306,14 +306,30 @@ void UartToStm32::targetVelocityCallback(const std_msgs::msg::Float32MultiArray:
     return;
   }
 
-  const float vx_cm_per_s = msg->data[0];
-  const float vy_cm_per_s = msg->data[1];
+  float vx_cm_per_s = msg->data[0];
+  float vy_cm_per_s = msg->data[1];
   const float vz_cm_per_s = msg->data[2];
   const float vyaw_deg_per_s = msg->data[3];
 
+  // PID 在 map 系算 vx/vy（误差=目标map−当前map），但飞控速度环要的是机体系速度
+  // （0x32 当前速度反馈也旋成了机体系，目标必须同系才能闭环）。这里照 0x32 把水平速度
+  // 旋到机体系；vz/vyaw 与坐标系无关，原样发。yaw≈0 时旋转是恒等变换，行为不变。
+  if (yaw_valid_) {
+    const Eigen::Vector3d body_vel =
+      transformVelocity(Eigen::Vector3d(vx_cm_per_s, vy_cm_per_s, 0.0), current_yaw_);
+    vx_cm_per_s = static_cast<float>(body_vel.x());
+    vy_cm_per_s = static_cast<float>(body_vel.y());
+  } else {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 2000,
+      "Yaw not valid yet; forwarding /target_velocity unrotated (assumes yaw~0). "
+      "Body-frame conversion skipped until tf %s->%s is available.",
+      source_frame_.c_str(), target_frame_.c_str());
+  }
+
   RCLCPP_DEBUG_THROTTLE(
     node_->get_logger(), *node_->get_clock(), 1000,
-    "Target Velocity: linear(%.1f, %.1f, %.1f)cm/s angular(%.1f)deg/s",
+    "Target Velocity (body): linear(%.1f, %.1f, %.1f)cm/s angular(%.1f)deg/s",
     vx_cm_per_s, vy_cm_per_s, vz_cm_per_s, vyaw_deg_per_s);
 
   sendTargetVelocityToSerial(vx_cm_per_s, vy_cm_per_s, vz_cm_per_s, vyaw_deg_per_s);

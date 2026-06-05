@@ -40,8 +40,9 @@ struct InventoryWaypoint
 
 enum class MissionMode
 {
-  TRAVERSE,   // 要求1：遍历盘点 2 货架 4 面 24 码
-  DIRECTED    // 要求2：先识别抽取码 → 只飞去那一个货位盘点
+  TRAVERSE,    // 要求1：遍历盘点 2 货架 4 面 24 码
+  DIRECTED,    // 要求2：先识别抽取码 → 只飞去那一个货位盘点
+  ROTATE_TEST  // 调试：起飞→前进→原地 yaw 180°→返航→降落，验证旋转+平移飞控（不开识别/激光）
 };
 
 enum class MissionPhase
@@ -104,6 +105,9 @@ private:
   void buildTraverseWaypoints();
   // 构建定向航线：起飞→直飞目标货位→盘点→返航。target_slot 由识别结果映射得到。
   void buildDirectedWaypoints(const std::string & target_slot);
+  // 构建旋转测试航线（调试用，不开识别/激光）：
+  //   起飞到 test_height → 前进 test_forward → 原地 yaw 转 test_yaw → 返航 → 降落。
+  void buildRotateTestWaypoints();
 
   // 货位（"A1".."D6"）→ 盘点航点。遍历与定向共用此函数，保证"定向直飞的点"
   // 与"遍历记录该货位时的点"严格一致。几何来自题目 图1/图2（仍需场地标定 y_center 等）。
@@ -153,6 +157,12 @@ private:
   double slot_col_spacing_cm_;        // 同面相邻列间距 50
   double slot_row_spacing_cm_;        // 同面上下行间距 80（上行105、下行25 之类，见 cpp）
   double scan_standoff_cm_;           // 相机离板面的水平后撤距离（视场决定）
+
+  // 旋转测试航线参数（mode:=rotate_test，纯飞控验证，可在 launch 改无需重编）
+  double test_height_cm_;             // 测试悬停高度（默认 100）
+  double test_forward_cm_;            // 沿 map +x 前进距离（默认 200）
+  double test_yaw_deg_;              // 原地旋转目标偏航（默认 180）
+  double test_yaw_step_deg_;          // 偏航分步步长（默认 90）：避开 ±180 跳变 + 限单步误差
 
   // ── 航点 / 阶段 ──
   std::vector<InventoryWaypoint> waypoints_;

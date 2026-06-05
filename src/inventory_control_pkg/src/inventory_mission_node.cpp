@@ -31,7 +31,9 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   base_frame_ = declare_parameter<std::string>("base_frame", "laser_link");
 
   mode_str_ = declare_parameter<std::string>("mode", "traverse");
-  mode_ = (mode_str_ == "directed") ? MissionMode::DIRECTED : MissionMode::TRAVERSE;
+  if (mode_str_ == "directed")          mode_ = MissionMode::DIRECTED;
+  else if (mode_str_ == "rotate_test")  mode_ = MissionMode::ROTATE_TEST;
+  else                                  mode_ = MissionMode::TRAVERSE;
   active_mode_ = mode_;
 
   // 遍历哪些面：默认四面全跑；只有货架1时设 "A,B" 即可只扫前后两面，不会飞向货架2。
@@ -70,6 +72,12 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   slot_row_spacing_cm_ = declare_parameter<double>("slot_row_spacing_cm", 80.0);
   scan_standoff_cm_    = declare_parameter<double>("scan_standoff_cm", 60.0);
 
+  // 旋转测试航线参数（mode:=rotate_test）
+  test_height_cm_     = declare_parameter<double>("test_height_cm", 100.0);
+  test_forward_cm_    = declare_parameter<double>("test_forward_cm", 200.0);
+  test_yaw_deg_       = declare_parameter<double>("test_yaw_deg", 180.0);
+  test_yaw_step_deg_  = declare_parameter<double>("test_yaw_step_deg", 90.0);
+
   // ── 发布 ──
   target_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>("/target_position", 10);
   active_controller_pub_ = create_publisher<std_msgs::msg::UInt8>("/active_controller", 10);
@@ -102,6 +110,9 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   // ── 航线 ──
   if (active_mode_ == MissionMode::TRAVERSE) {
     buildTraverseWaypoints();
+    phase_ = MissionPhase::TAKEOFF;
+  } else if (active_mode_ == MissionMode::ROTATE_TEST) {
+    buildRotateTestWaypoints();
     phase_ = MissionPhase::TAKEOFF;
   } else {
     // DIRECTED：先在地面识别抽取码，识别成功后再 buildDirectedWaypoints。
@@ -384,6 +395,44 @@ void InventoryMissionNode::buildDirectedWaypoints(const std::string & target_slo
 
   waypoints_.push_back({land_x_cm_, land_y_cm_, flight_height_cm_, 0.0, false, "", "return"});
   waypoints_.push_back({land_x_cm_, land_y_cm_, land_height_cm_, 0.0, false, "", "land"});
+}
+
+void InventoryMissionNode::buildRotateTestWaypoints()
+{
+  // 纯飞控验证：全部为过渡航点（scan=false，不开识别/激光）。
+  //   1) 起飞到 test_height（home 上空，yaw 0）
+  //   2) 沿 map +x 前进 test_forward（yaw 0）
+  //   3) 原地分步旋转 0 → test_yaw（位置不动，只转 yaw），转到后保持该朝向
+  //   4) 保持 test_yaw 朝向平移返航
+  //   5) 在 home 垂直降落（保持 test_yaw）
+  //
+  // 旋转分步（test_yaw_step_deg）：限制单步偏航误差，配合 PID max_angular_velocity 让转速更柔和、
+  // 每步可停下观察。想更慢：给位置PID launch 传更小的 max_angular_velocity（默认 30°/s）。
+  //
+  // ⚠ 这一版「转到 test_yaw 后带偏航平移返航」会**真正触发**带偏航平移：PID 发的 /target_velocity
+  //   是 map 系，uart_to_stm32(帧 0x31) 未旋到机体系，若 STM32 固件按机体系解释则返航会反向。
+  //   这正是盘点扫背面（yaw 180）要用的同款动作，所以本测试顺带把它验证了——首飞务必小油门、
+  //   人随时接管，重点看「转到 180 后往 home 飞时方向对不对」。
+  waypoints_.clear();
+  const double fwd_x = home_x_cm_ + test_forward_cm_;
+
+  // 1) 起飞 + 2) 前进（yaw 0）
+  waypoints_.push_back({home_x_cm_, home_y_cm_, test_height_cm_, 0.0, false, "", "takeoff"});
+  waypoints_.push_back({fwd_x,      home_y_cm_, test_height_cm_, 0.0, false, "", "forward"});
+
+  // 3) 原地分步旋转：0 → test_yaw（x,y,z 不变，只改 yaw）
+  const double sign = (test_yaw_deg_ >= 0.0) ? 1.0 : -1.0;
+  const double goal = std::fabs(test_yaw_deg_);
+  const double step = std::max(1.0, std::fabs(test_yaw_step_deg_));
+  const int    n    = (goal < 1e-6) ? 0 : static_cast<int>(std::ceil(goal / step));
+  for (int i = 1; i <= n; ++i) {
+    const double y = sign * std::min(goal, i * step);
+    waypoints_.push_back({fwd_x, home_y_cm_, test_height_cm_, y, false, "", "rotate"});
+  }
+
+  // 4) 保持 test_yaw 平移返航 + 5) 垂直降落（保持 test_yaw）
+  waypoints_.push_back({home_x_cm_, home_y_cm_, test_height_cm_, test_yaw_deg_, false, "", "return"});
+  waypoints_.push_back({home_x_cm_, home_y_cm_, land_height_cm_, test_yaw_deg_, false, "", "land"});
 }
 
 void InventoryMissionNode::recordInventory(const std::string & slot, int cargo_id)

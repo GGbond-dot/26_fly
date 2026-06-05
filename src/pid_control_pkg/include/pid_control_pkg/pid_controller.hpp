@@ -36,11 +36,17 @@ public:
   void setOutputLimits(double max_output, double min_output);
   void setIntegralLimit(double integral_limit);
   void setDeadzone(double deadzone);
+  // 角度模式：误差与微分增量都按 (-180,180] 归一化，根治偏航跨 ±180° 时的微分跳变。
+  // 仅偏航通道开启；xy/z 通道保持普通线性模式。
+  void setAngular(bool angular) { angular_ = angular; }
 
   double getError() const { return current_error_; }
   double getIntegral() const { return integral_; }
 
 private:
+  static double normalizeAngleDeg(double angle_deg);
+
+
   double kp_;
   double ki_;
   double kd_;
@@ -54,6 +60,7 @@ private:
   double prev_derivative_;
   bool first_call_;
   double derivative_filter_alpha_;
+  bool angular_ = false;
 };
 
 class PositionPIDController : public rclcpp::Node
