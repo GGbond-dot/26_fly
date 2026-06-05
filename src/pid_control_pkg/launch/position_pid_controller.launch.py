@@ -1,8 +1,16 @@
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
+    # 偏航角速度上限做成可传参（默认 30°/s，植保/搬运不变）；旋转测试想更柔和可传更小值。
+    max_angular_velocity_arg = DeclareLaunchArgument(
+        "max_angular_velocity", default_value="30.0",
+        description="偏航最大角速度 deg/s（旋转转速上限）")
+
     pid_params = {
         # 控制循环与 TF 坐标系
         "control_frequency": 50.0,         # PID 更新频率，单位 Hz
@@ -26,7 +34,9 @@ def generate_launch_description() -> LaunchDescription:
 
         # 输出限幅
         "max_linear_velocity": 33.0,       # XY 最大速度，单位 cm/s
-        "max_angular_velocity": 30.0,      # 最大偏航角速度，单位 deg/s
+        # 偏航角速度上限走 launch 参数（默认 30°/s），旋转测试想更柔和可传更小值
+        "max_angular_velocity": ParameterValue(
+            LaunchConfiguration("max_angular_velocity"), value_type=float),
         "max_vertical_velocity": 30.0,     # Z 方向最大速度，单位 cm/s
 
         # 视觉接管控制：像素误差 -> XY 速度指令
@@ -42,6 +52,7 @@ def generate_launch_description() -> LaunchDescription:
     }
 
     return LaunchDescription([
+        max_angular_velocity_arg,
         Node(
             package="pid_control_pkg",
             executable="position_pid_controller",

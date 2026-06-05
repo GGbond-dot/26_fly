@@ -1,8 +1,9 @@
 import os
 
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -23,7 +24,8 @@ def generate_launch_description():
     tf(map->laser_link) / /height / 位置PID(/target_velocity)：
         1) fly_carto             cartographer，出 tf map->laser_link + /scan
         2) uart_to_stm32         串口桥，发 /height、把 /target_velocity(0x31) 转给飞控
-        3) position_pid_controller  标准位置 PID（z 走 /height，**不用面阵激光**）
+        3) position_pid_controller  标准位置 PID（z 走 /height，**不用面阵激光**），
+                                  偏航角速度上限默认 30°/s（180° 约 6s）；想更柔和：max_angular_velocity:=xx
 
     ⚠ 本 launch 不含任务节点——航点由 rotate_test 单独起（第二个终端）：
         终端1：ros2 launch my_launch rotate_test_basic.launch.py
@@ -37,6 +39,12 @@ def generate_launch_description():
        0x31 transformVelocity（map->机体）旋转——小油门、人随时接管，盯
        「转到180后往home飞方向对不对」。
     """
+    # 旋转转速上限：默认 30°/s（180° 约 6s；20 太慢要 9s 已弃）。想更柔和再传更小值。
+    max_angular_velocity = LaunchConfiguration("max_angular_velocity")
+    max_angular_velocity_arg = DeclareLaunchArgument(
+        "max_angular_velocity", default_value="30.0",
+        description="偏航最大角速度 deg/s（旋转转速上限，默认 30；想更柔和传更小值）")
+
     fly_carto_launch = _include(
         "my_carto_pkg",
         "fly_carto.launch.py",
@@ -51,9 +59,11 @@ def generate_launch_description():
     position_pid_controller_launch = _include(
         "pid_control_pkg",
         "position_pid_controller.launch.py",
+        {"max_angular_velocity": max_angular_velocity},
     )
 
     return LaunchDescription([
+        max_angular_velocity_arg,
         fly_carto_launch,
         uart_to_stm32_launch,
         position_pid_controller_launch,

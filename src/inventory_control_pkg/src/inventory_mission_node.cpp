@@ -76,7 +76,9 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   test_height_cm_     = declare_parameter<double>("test_height_cm", 100.0);
   test_forward_cm_    = declare_parameter<double>("test_forward_cm", 200.0);
   test_yaw_deg_       = declare_parameter<double>("test_yaw_deg", 180.0);
-  test_yaw_step_deg_  = declare_parameter<double>("test_yaw_step_deg", 90.0);
+  // 默认 180=一口气连续转（±180 跳变已由 PID 角度模式根治，不再需要分步保险）。
+  // 想分段观察可传更小值（如 90/45），每步到位停一下。
+  test_yaw_step_deg_  = declare_parameter<double>("test_yaw_step_deg", 180.0);
 
   // ── 发布 ──
   target_pub_ = create_publisher<std_msgs::msg::Float32MultiArray>("/target_position", 10);
@@ -319,39 +321,61 @@ bool InventoryMissionNode::runIdentifyTarget()
 }
 
 // ───────────────────────────── 货位 → 航点（遍历/定向共用，保证一致）
+namespace
+{
+// 一个货架面的实测几何（坐标系：起飞黑方框中心=(0,0)，蟹行机头顶板面）。
+//   x_cm   ：飞机正对该面悬停时的 x（相机/激光到板的 standoff 已含在内，直接是飞机位置）
+//   yaw_deg：该面机头朝向（正面 0、背面整机转 180）
+//   col_y  ：三列二维码飞机观测点的 y，按 y 递增排列（列0/1/2）
+//   z_high / z_low：高行 / 低行二维码对准时的飞机高度
+struct FaceGeometry
+{
+  double x_cm;
+  double yaw_deg;
+  std::array<double, 3> col_y_cm;
+  double z_high_cm;
+  double z_low_cm;
+  bool   measured;   // false=尚未标定的占位值（货架2 C/D）
+};
+
+// ⚠ 场地实测标定（2026-06-05，货架1 两面 A/B；坐标系见上）：
+//   A 面：飞机 x=0、机头朝 +x(yaw 0)，三列 y=70/123/173，高行 z=129、低行 z=90。
+//   B 面：飞机 x=150、转 180(yaw 180)，三列 y=75/128/178，高行 z=133、低行 z=91。
+//   （A/B 两面 y 值略有差异属实测正常，不是公式，故逐面写死。）
+//   C/D 面（货架2）尚未标定——下方为占位，盘点货架2 前必须实测填入并把 measured 改 true。
+FaceGeometry faceGeometry(char face)
+{
+  switch (face) {
+    case 'A': return {  0.0,   0.0, {{ 70.0, 123.0, 173.0}}, 129.0, 90.0, true};
+    case 'B': return {150.0, 180.0, {{ 75.0, 128.0, 178.0}}, 133.0, 91.0, true};
+    // TODO(标定)：货架2 C/D 实测后替换占位，measured 改 true。
+    case 'C': return {300.0,   0.0, {{ 70.0, 123.0, 173.0}}, 129.0, 90.0, false};
+    case 'D': return {450.0, 180.0, {{ 75.0, 128.0, 178.0}}, 133.0, 91.0, false};
+    default:  return {  0.0,   0.0, {{ 70.0, 123.0, 173.0}}, 129.0, 90.0, false};
+  }
+}
+}  // namespace
+
 InventoryWaypoint InventoryMissionNode::slotToScanWaypoint(const std::string & slot) const
 {
   // slot = 面字符(A/B/C/D) + 货位号(1..6)，如 "C5"。
+  // 货位编号约定：idx 1/2/3 = 高行 列0/1/2，idx 4/5/6 = 低行 列0/1/2（列按 y 递增）。
+  // ⚠ 货位号↔真实二维码的对应仍待标定（B/D 背面尤其要核），但**飞机观测坐标**已是实测值，
+  //   遍历/定向直飞共用此函数，保证两者落点一致。
   const char face = slot.empty() ? 'A' : slot[0];
   int idx = 1;
   try { idx = std::stoi(slot.substr(1)); } catch (...) { idx = 1; }
   idx = std::max(1, std::min(6, idx));
 
-  // 面 → 货架 x / yaw / standoff 后撤方向。A/B 在货架1，C/D 在货架2；
-  // B/D 是背面，整机 yaw 转 180°，相机从货架另一侧（+x）后撤。
-  const double shelf_x   = (face == 'A' || face == 'B') ? shelf1_x_cm_ : shelf2_x_cm_;
-  const bool   back_face = (face == 'B' || face == 'D');
-  const double yaw          = back_face ? 180.0 : 0.0;
-  const double standoff_sign = back_face ? +1.0 : -1.0;
-  const double face_x = shelf_x + standoff_sign * scan_standoff_cm_;
-
-  const int row = (idx - 1) / 3;    // 0=上行(1,2,3) 1=下行(4,5,6)
-  int       col = (idx - 1) % 3;    // 0,1,2 = 正面视角 左→右
-  // 背面(B/D)相机朝向相反，列的左右在 map-y 上镜像翻转。
-  // TODO(标定)：若实测 B/D 列方向反了，去掉这行镜像即可——这是唯一的列方向开关。
-  if (back_face) col = 2 - col;
-
-  // TODO(场地标定)：y_center 为货架沿 y 方向中心、row_z 为上下行真实高度，
-  // 均需按本机 cartographer 地图原点 + 题目图2（下沿60、行间40+40）实测填写。
-  const double y_center = home_y_cm_ + 250.0;  // 占位
-  const std::array<double, 3> col_dy = {-slot_col_spacing_cm_, 0.0, slot_col_spacing_cm_};
-  const std::array<double, 2> row_z  = {flight_height_cm_, flight_height_cm_ - slot_row_spacing_cm_};
+  const FaceGeometry geo = faceGeometry(face);
+  const int row = (idx - 1) / 3;    // 0=高行(1,2,3) 1=低行(4,5,6)
+  const int col = (idx - 1) % 3;    // 0,1,2 → y 递增
 
   InventoryWaypoint wp;
-  wp.x_cm    = face_x;
-  wp.y_cm    = y_center + col_dy[col];
-  wp.z_cm    = row_z[row];
-  wp.yaw_deg = yaw;
+  wp.x_cm    = geo.x_cm;
+  wp.y_cm    = geo.col_y_cm[col];
+  wp.z_cm    = (row == 0) ? geo.z_high_cm : geo.z_low_cm;
+  wp.yaw_deg = geo.yaw_deg;
   wp.scan    = true;
   wp.slot    = slot;
   wp.tag     = "scan";
@@ -362,23 +386,57 @@ InventoryWaypoint InventoryMissionNode::slotToScanWaypoint(const std::string & s
 void InventoryMissionNode::buildTraverseWaypoints()
 {
   waypoints_.clear();
+  if (traverse_faces_.empty()) return;
 
-  // 起飞航点（在 home 上空升到巡航高）
-  waypoints_.push_back({home_x_cm_, home_y_cm_, flight_height_cm_, 0.0,
-                        false, "", "takeoff"});
+  // ── 蛇形（弓字形）扫描，z 与 y 都走折返以省时（要求1-5 越快越好）──
+  //   面间：第 0/2.. 面（A,C）先扫高行、第 1/3.. 面（B,D）先扫低行。
+  //         上一面在低行收尾 → 下一面就从低行起步，避免反复上下爬高。
+  //   面内：第一行 y 递增(列0→2)，第二行 y 递减(列2→0)。
+  //   换面：回到 y 轴 → 沿 x 平移到本面正前方 → 原地旋到本面朝向（背面 yaw 180 在此完成）。
+  // 实测验证（2026-06-05，货架1）：
+  //   A: (0,70,129)→(0,123,129)→(0,173,129)→(0,173,90)→(0,123,90)→(0,70,90)
+  //   B(转180): (150,75,91)→(150,128,91)→(150,178,91)→(150,178,133)→(150,128,133)→(150,75,133)
 
-  // 按 traverse_faces_ 顺序逐面盘点（默认 A→B→C→D；只有货架1时传 "A,B"）。
-  // 同面 6 个货位 1..6（A→B、C→D 之间的换面过渡航点：回实验室结合实测坐标插入，
-  // 详见开发笔记 §三建议）。
-  for (const std::string & face : traverse_faces_) {
-    for (int idx = 1; idx <= 6; ++idx) {
-      waypoints_.push_back(slotToScanWaypoint(face + std::to_string(idx)));
+  // 起飞：在 home 上空升到第一面"先扫行"的盘点高度。
+  const FaceGeometry first = faceGeometry(traverse_faces_.front()[0]);
+  waypoints_.push_back({home_x_cm_, home_y_cm_, first.z_high_cm, 0.0, false, "", "takeoff"});
+
+  for (std::size_t fi = 0; fi < traverse_faces_.size(); ++fi) {
+    const std::string & face = traverse_faces_[fi];
+    const FaceGeometry geo = faceGeometry(face[0]);
+    if (!geo.measured) {
+      RCLCPP_WARN(get_logger(),
+                  "面 %s 坐标尚未标定（占位值）！盘点货架2 前必须实测填入 faceGeometry，"
+                  "本轮货架1 测试请用 traverse_faces:=A,B", face.c_str());
     }
+    const bool high_first = (fi % 2 == 0);
+    const double first_z = high_first ? geo.z_high_cm : geo.z_low_cm;
+
+    // 换面过渡（除第一面外）：先回 y 轴、再平移到位、最后原地旋转，分三步避免边走边转。
+    if (fi > 0) {
+      const FaceGeometry prev = faceGeometry(traverse_faces_[fi - 1][0]);
+      waypoints_.push_back({prev.x_cm, home_y_cm_, first_z, prev.yaw_deg, false, "", "return_axis"});
+      waypoints_.push_back({geo.x_cm,  home_y_cm_, first_z, prev.yaw_deg, false, "", "transit"});
+      waypoints_.push_back({geo.x_cm,  home_y_cm_, first_z, geo.yaw_deg,  false, "", "rotate"});
+    }
+
+    // 本面 6 个 scan 航点：先扫行 列0→2（y 递增），后扫行 列2→0（y 递减）。
+    // 高行槽号 1..3、低行 4..6（见 slotToScanWaypoint）。
+    const int first_base  = high_first ? 1 : 4;
+    const int second_base = high_first ? 4 : 1;
+    for (int c = 0; c <= 2; ++c)
+      waypoints_.push_back(slotToScanWaypoint(face + std::to_string(first_base + c)));
+    for (int c = 2; c >= 0; --c)
+      waypoints_.push_back(slotToScanWaypoint(face + std::to_string(second_base + c)));
   }
 
-  // 返航 + 降落
-  waypoints_.push_back({land_x_cm_, land_y_cm_, flight_height_cm_, 0.0, false, "", "return"});
-  waypoints_.push_back({land_x_cm_, land_y_cm_, land_height_cm_, 0.0, false, "", "land"});
+  // 返航 + 降落。本轮（货架1 两面测试）在最后一面正前方的 y 轴上降落（终点=最后面 x, y=home）。
+  // TODO(正式赛)：四面全跑时降落点应为黑圆 land_x_cm_/land_y_cm_，标定后切回。
+  const FaceGeometry last = faceGeometry(traverse_faces_.back()[0]);
+  const bool last_high_first = ((traverse_faces_.size() - 1) % 2 == 0);
+  const double end_z = last_high_first ? last.z_low_cm : last.z_high_cm;  // 末面收尾行高度
+  waypoints_.push_back({last.x_cm, home_y_cm_, end_z,           last.yaw_deg, false, "", "return"});
+  waypoints_.push_back({last.x_cm, home_y_cm_, land_height_cm_, last.yaw_deg, false, "", "land"});
 }
 
 void InventoryMissionNode::buildDirectedWaypoints(const std::string & target_slot)

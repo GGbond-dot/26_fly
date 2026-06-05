@@ -32,8 +32,9 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         DeclareLaunchArgument("mode", default_value="traverse",
                               description="traverse=遍历盘点 / directed=定向盘点"),
-        DeclareLaunchArgument("traverse_faces", default_value="A,B,C,D",
-                              description="遍历哪些面（逗号分隔）。只有货架1时设 A,B 只扫前后两面"),
+        DeclareLaunchArgument("traverse_faces", default_value="A,B",
+                              description="遍历哪些面（逗号分隔）。默认 A,B 只扫货架1（C/D 坐标尚未标定，"
+                                          "标定货架2 后传 A,B,C,D 打开）"),
         # 盘点相机 = 之前植保的下视相机 down_cam(/dev/video0)。by-path 稳定路径，插拔不变号。
         DeclareLaunchArgument(
             "camera_device",

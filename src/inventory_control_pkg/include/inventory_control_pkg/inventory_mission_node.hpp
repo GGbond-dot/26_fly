@@ -162,7 +162,7 @@ private:
   double test_height_cm_;             // 测试悬停高度（默认 100）
   double test_forward_cm_;            // 沿 map +x 前进距离（默认 200）
   double test_yaw_deg_;              // 原地旋转目标偏航（默认 180）
-  double test_yaw_step_deg_;          // 偏航分步步长（默认 90）：避开 ±180 跳变 + 限单步误差
+  double test_yaw_step_deg_;          // 偏航分步步长（默认 180=连续转）；设更小值则分段转，每步停一下
 
   // ── 航点 / 阶段 ──
   std::vector<InventoryWaypoint> waypoints_;

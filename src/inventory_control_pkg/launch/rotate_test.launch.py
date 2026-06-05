@@ -19,10 +19,11 @@ rotate_test 需要 tf map→laser_link（carto 提供）和 /height（uart 上�
   旋转分步限制单步误差；±180 微分跳变已在位置PID（yaw通道角度归一化）根治。想更慢：降 max_angular_velocity。
 
 常用：
-  ros2 launch inventory_control_pkg rotate_test.launch.py
+  ros2 launch inventory_control_pkg rotate_test.launch.py                       # 默认连续转 180
   ros2 launch inventory_control_pkg rotate_test.launch.py test_forward_cm:=150 test_yaw_deg:=90
-  # 转更慢：分步更细 + 降 PID 角速度上限（角速度上限在位置PID那条 launch 传）
-  ros2 launch inventory_control_pkg rotate_test.launch.py test_yaw_step_deg:=45
+  ros2 launch inventory_control_pkg rotate_test.launch.py test_yaw_step_deg:=45 # 想分段观察才设小值
+  # 转速由位置PID 的 max_angular_velocity 决定（不是步长）：默认 30°/s（180°约6s）。
+  # 想更柔和：max_angular_velocity:=xx 传给 rotate_test_basic（见 my_launch/rotate_test_basic）。
 """
 
 from launch import LaunchDescription
@@ -44,8 +45,8 @@ def generate_launch_description() -> LaunchDescription:
                               description="沿 map +x 前进距离 cm"),
         DeclareLaunchArgument("test_yaw_deg", default_value="180.0",
                               description="原地旋转目标偏航 deg（会转过去再转回 0）"),
-        DeclareLaunchArgument("test_yaw_step_deg", default_value="90.0",
-                              description="偏航分步步长 deg：避开 ±180 跳变 + 限单步误差，越小越柔和"),
+        DeclareLaunchArgument("test_yaw_step_deg", default_value="180.0",
+                              description="偏航分步步长 deg：默认 180=一口气连续转；设更小值(如90/45)则分段转每步停一下"),
 
         Node(
             package="inventory_control_pkg",

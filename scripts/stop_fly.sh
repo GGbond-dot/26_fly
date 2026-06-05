@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 停止自启/试飞的所有进程（spray 自启 + 手动 run_test 都覆盖）
+# 停止自启/试飞的所有进程（盘点自启 + 手动 run_test 都覆盖）
+# ⚠ launch 名跟着 autostart_fly.sh 的 LAUNCH_PKG/LAUNCH_FILE 走，改一处要同步改另一处。
 
 LOG_DIR="${FLY_LOG_DIR:-$HOME/fly_logs}"
 PUSH_USER="${FLY_LOG_PUSH_USER:-kian}"
@@ -86,8 +87,16 @@ push_archive_to_pc() {
 
 echo "[stop] stopping fly processes..."
 
+# 与 autostart_fly.sh 保持同一套 env 默认值：默认值若改了，这里自动跟着匹配。
+# ⚠ 改 autostart_fly.sh 的 LAUNCH_PKG/LAUNCH_FILE 时，务必同步本处（两脚本要一致）。
+LAUNCH_PKG="${AUTOSTART_PKG:-inventory_control_pkg}"
+LAUNCH_FILE="${AUTOSTART_LAUNCH:-qr_laser_test.launch.py}"
+
 pkill -INT -f "ros2 bag record"
 sleep 1
+# 当前自启的盘点 launch（按 env 默认值匹配）
+pkill -INT -f "ros2 launch $LAUNCH_PKG $LAUNCH_FILE"
+# 兜底：旧的搬运/植保 launch 名（历史自启遗留）
 pkill -INT -f "ros2 launch my_launch spray_basic.launch.py"
 pkill -INT -f "ros2 launch my_launch demo3.launch.py"
 sleep 1
@@ -95,8 +104,11 @@ pkill -INT -f "scripts/autostart_fly.sh"
 pkill -INT -f "scripts/run_test.sh"
 sleep 2
 
+# 仍残留的 ros2 launch 子进程（SIGINT 没收住时）补一刀
+pkill -INT -f "ros2 launch $LAUNCH_PKG $LAUNCH_FILE" || true
+
 echo "[stop] remaining related processes:"
-pgrep -af "autostart_fly.sh|run_test.sh|ros2 bag record|ros2 launch my_launch" || true
+pgrep -af "autostart_fly.sh|run_test.sh|ros2 bag record|ros2 launch $LAUNCH_PKG|ros2 launch my_launch" || true
 
 echo "[stop] collecting latest autostart logs..."
 latest_autostart_log="$(find_latest_autostart_log)"
