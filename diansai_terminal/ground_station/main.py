@@ -334,10 +334,7 @@ class WarehouseMap(QWidget):
         if self.target_slot not in self.waypoints:
             return
 
-        takeoff = self.config["warehouse"]["takeoff"]
-        landing = self.config["warehouse"]["landing"]
-        waypoint = self.waypoints[self.target_slot]
-        points = self._orthogonal_route_points(plot, takeoff, landing, waypoint)
+        points = self._orthogonal_route_points(plot)
 
         painter.setPen(QPen(QColor("#1976d2"), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
         for p1, p2 in zip(points, points[1:]):
@@ -346,22 +343,27 @@ class WarehouseMap(QWidget):
         for p1, p2 in zip(points, points[1:]):
             painter.drawLine(p1, p2)
 
-    def _orthogonal_route_points(
-        self,
-        plot: QRectF,
-        takeoff: dict[str, float],
-        landing: dict[str, float],
-        waypoint: Waypoint,
-    ) -> list[QPointF]:
-        # 大致复刻飞机绕板：出去沿起飞侧底边滑到本列、沿本列爬进货位；
-        # 回来沿本列继续爬到板子外侧的空走廊(return_y)，再在走廊里横移到降落点 ——
-        # 不在货位高度直接横穿货架(那条横线会戳穿 x=1.5/3.5 的板)。
+    def route_points_m(self, slot: str) -> list[tuple[float, float]]:
+        """进阶任务规划航线（米，仓库坐标系），不依赖绘图——供 route_debug 脱机调试复用。
+
+        大致复刻飞机绕板：出去沿起飞侧底边滑到本列、沿本列爬进货位；
+        回来沿本列继续爬到板子外侧的空走廊(return_y)，再在走廊里横移到降落点 ——
+        不在货位高度直接横穿货架(那条横线会戳穿 x=1.5/3.5 的板)。
+        """
+        waypoint = self.waypoints[slot]
+        takeoff = self.config["warehouse"]["takeoff"]
+        landing = self.config["warehouse"]["landing"]
         racks = self.config["warehouse"].get("racks", [])
+        board_ymin = min((float(r.get("y_min", 0.0)) for r in racks), default=0.0)
         board_ymax = max((float(r.get("y_max", 0.0)) for r in racks), default=0.0)
+        # 横移必须避开板的 y 跨度：出发底边走廊压到板下方(< 所有板 y_min)，
+        # 返航走廊抬到板上方(> 所有板 y_max)。竖段沿货位本列 x（设计上无板）爬升，天然不碰板。
+        out_y = min(float(takeoff["y"]), board_ymin - 0.2)
         return_y = max(float(landing["y"]), board_ymax + 0.2)
         route = [
             (float(takeoff["x"]), float(takeoff["y"])),
-            (waypoint.x, float(takeoff["y"])),
+            (float(takeoff["x"]), out_y),
+            (waypoint.x, out_y),
             (waypoint.x, waypoint.y),
             (waypoint.x, return_y),
             (float(landing["x"]), return_y),
@@ -371,7 +373,10 @@ class WarehouseMap(QWidget):
         for point in route:
             if not compact or point != compact[-1]:
                 compact.append(point)
-        return [self._point(plot, x, y) for x, y in compact]
+        return compact
+
+    def _orthogonal_route_points(self, plot: QRectF) -> list[QPointF]:
+        return [self._point(plot, x, y) for x, y in self.route_points_m(self.target_slot)]
 
     def _draw_slots(self, painter: QPainter, plot: QRectF) -> None:
         painter.setFont(QFont("Sans Serif", 11, QFont.Bold))
