@@ -89,8 +89,8 @@ echo "[stop] stopping fly processes..."
 
 # 与 autostart_fly.sh 保持同一套 env 默认值：默认值若改了，这里自动跟着匹配。
 # ⚠ 改 autostart_fly.sh 的 LAUNCH_PKG/LAUNCH_FILE 时，务必同步本处（两脚本要一致）。
-LAUNCH_PKG="${AUTOSTART_PKG:-inventory_control_pkg}"
-LAUNCH_FILE="${AUTOSTART_LAUNCH:-qr_laser_test.launch.py}"
+LAUNCH_PKG="${AUTOSTART_PKG:-my_launch}"
+LAUNCH_FILE="${AUTOSTART_LAUNCH:-inventory_full.launch.py}"
 
 pkill -INT -f "ros2 bag record"
 sleep 1

@@ -18,13 +18,17 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   scan_active_(false),
   scan_qr_aligned_(false),
   has_qr_id_(false),
+  scan_laser_fired_(false),
+  scan_retreated_(false),
+  retreat_in_progress_(false),
   target_identified_(false),
   target_cargo_id_(0),
   has_target_slot_(false),
   has_height_(false),
   current_height_cm_(0.0),
   mission_complete_sent_(false),
-  first_publish_done_(false)
+  first_publish_done_(false),
+  status_inited_(false)
 {
   // ── 参数 ──
   map_frame_  = declare_parameter<std::string>("map_frame", "map");
@@ -51,7 +55,7 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
     if (traverse_faces_.empty()) traverse_faces_ = {"A", "B", "C", "D"};
   }
 
-  pos_tol_cm_    = declare_parameter<double>("pos_tol_cm", 12.0);
+  pos_tol_cm_    = declare_parameter<double>("pos_tol_cm", 6.0);
   yaw_tol_deg_   = declare_parameter<double>("yaw_tol_deg", 8.0);
   height_tol_cm_ = declare_parameter<double>("height_tol_cm", 15.0);
 
@@ -61,9 +65,21 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   home_y_cm_ = declare_parameter<double>("home_y_cm", 0.0);
   land_x_cm_ = declare_parameter<double>("land_x_cm", 0.0);
   land_y_cm_ = declare_parameter<double>("land_y_cm", 0.0);
+  // 四面全跑(要求1)落黑圆 land_x/y；单货架测试(traverse_faces:=A,B)留 false 落末面 y 轴。
+  land_at_circle_ = declare_parameter<bool>("land_at_circle", false);
+  // 换面过渡航点(回y轴/平移/旋转)的 y：往后退离板面，默认 -20（不再贴 y=0）。
+  transit_y_cm_ = declare_parameter<double>("transit_y_cm", -20.0);
+  // 定向返航横移走廊的 y（板子远侧空旷处，默认 300）：沿本列爬到此 y 再横移到降落 x。
+  directed_return_y_cm_ = declare_parameter<double>("directed_return_y_cm", 300.0);
 
   scan_settle_sec_  = declare_parameter<double>("scan_settle_sec", 0.8);
   scan_timeout_sec_ = declare_parameter<double>("scan_timeout_sec", 6.0);
+  // 超时补救：沿机头反方向后撤这么多 cm 再试一次（离板远些好解码）。0=关闭后退、超时直接跳过。
+  scan_retreat_cm_  = declare_parameter<double>("scan_retreat_cm", 10.0);
+  // 后退重试时收严激光（standoff 变大→归一化窗口对应真实偏移变大，强制 strict_vertical 卡住纵向）。
+  tighten_laser_on_retreat_ = declare_parameter<bool>("tighten_laser_on_retreat", true);
+  // 与上一航点高度差超过此值才算“由升/降进入该货位”→ 开纵向严判（同行同高度横移不开）。
+  vertical_entry_tol_cm_ = declare_parameter<double>("vertical_entry_tol_cm", 5.0);
   led_blink_sec_    = declare_parameter<double>("led_blink_sec", 1.0);
 
   shelf1_x_cm_         = declare_parameter<double>("shelf1_x_cm", 150.0);
@@ -85,10 +101,13 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   active_controller_pub_ = create_publisher<std_msgs::msg::UInt8>("/active_controller", 10);
   route_choice_pub_ = create_publisher<std_msgs::msg::UInt8>("/route_choice", 10);
   qr_enable_pub_ = create_publisher<std_msgs::msg::Bool>("/qr_vision/enable", 10);
+  qr_strict_vertical_pub_ = create_publisher<std_msgs::msg::Bool>("/qr_vision/strict_vertical", 10);
   inventory_result_pub_ = create_publisher<std_msgs::msg::String>("/inventory_result", 10);
   inventory_led_pub_ = create_publisher<std_msgs::msg::Empty>("/inventory_led", 10);
   inventory_target_pub_ = create_publisher<std_msgs::msg::String>("/inventory_target", 10);
   mission_complete_pub_ = create_publisher<std_msgs::msg::Empty>("/mission_complete", 10);
+  // 状态/心跳 → 地面站显示飞机起没起好、识别/盘点到哪步（操作员只能看地面站）。
+  inventory_status_pub_ = create_publisher<std_msgs::msg::String>("/inventory_status", 10);
 
   // ── 订阅 ──
   height_sub_ = create_subscription<std_msgs::msg::Int16>(
@@ -100,25 +119,32 @@ InventoryMissionNode::InventoryMissionNode(const rclcpp::NodeOptions & options)
   qr_aligned_sub_ = create_subscription<std_msgs::msg::Bool>(
     "/qr_vision/aligned", 10,
     std::bind(&InventoryMissionNode::qrAlignedCallback, this, std::placeholders::_1));
+  qr_laser_fired_sub_ = create_subscription<std_msgs::msg::String>(
+    "/qr_vision/laser_fired", 10,
+    std::bind(&InventoryMissionNode::laserFiredCallback, this, std::placeholders::_1));
   // 要求2：地面站查表后下发目标货位（"A1".."D6"），飞机据此直飞
   target_slot_sub_ = create_subscription<std_msgs::msg::String>(
     "/inventory_target_slot", 10,
     std::bind(&InventoryMissionNode::targetSlotCallback, this, std::placeholders::_1));
+  // 任务模式：地面站告诉重启后的飞机本轮跑 traverse(普通) 还是 directed(进阶)
+  mode_cmd_sub_ = create_subscription<std_msgs::msg::String>(
+    "/inventory_mode", 10,
+    std::bind(&InventoryMissionNode::modeCommandCallback, this, std::placeholders::_1));
 
   // ── tf ──
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
   // ── 航线 ──
-  if (active_mode_ == MissionMode::TRAVERSE) {
-    buildTraverseWaypoints();
-    phase_ = MissionPhase::TAKEOFF;
-  } else if (active_mode_ == MissionMode::ROTATE_TEST) {
-    buildRotateTestWaypoints();
-    phase_ = MissionPhase::TAKEOFF;
+  // rotate_test 是纯调试航线，仍按 launch 参数立即配置起飞（不归地面站管）。
+  // 比赛模式(traverse/directed)：飞机重启后**原地待命 WAIT_MODE**，不起飞、不接管控制器，
+  // 等地面站发 /inventory_mode 告知本轮是普通还是进阶，收到才 configureForMode 配置起飞。
+  if (active_mode_ == MissionMode::ROTATE_TEST) {
+    configureForMode();
   } else {
-    // DIRECTED：先在地面识别抽取码，识别成功后再 buildDirectedWaypoints。
-    phase_ = MissionPhase::IDENTIFY;
+    phase_ = MissionPhase::WAIT_MODE;
+    RCLCPP_INFO(get_logger(),
+      "原地待命：等地面站下发任务模式 /inventory_mode（traverse=普通 / directed=进阶）…");
   }
 
   // 平时关识别（避免误打激光）
@@ -153,6 +179,16 @@ void InventoryMissionNode::qrAlignedCallback(const std_msgs::msg::Bool::SharedPt
   scan_qr_aligned_ = msg->data;
 }
 
+void InventoryMissionNode::laserFiredCallback(const std_msgs::msg::String::SharedPtr msg)
+{
+  // qr_vision 把激光打满 0.5s 后回报刚打的码。只在本货位扫描进行中才采信
+  // （平时 qr_vision 关识别不会发；扫描开始时已把 scan_laser_fired_ 复位，故无残留）。
+  std::lock_guard<std::mutex> lk(mutex_);
+  if (!scan_active_) return;
+  scan_laser_fired_ = true;
+  scan_laser_id_ = msg->data;
+}
+
 void InventoryMissionNode::targetSlotCallback(const std_msgs::msg::String::SharedPtr msg)
 {
   // 地面站下发的货位字符串（"A1".."D6"）。只取首字母+数字，容忍前后空白。
@@ -168,11 +204,70 @@ void InventoryMissionNode::targetSlotCallback(const std_msgs::msg::String::Share
   has_target_slot_ = true;
 }
 
+void InventoryMissionNode::modeCommandCallback(const std_msgs::msg::String::SharedPtr msg)
+{
+  // 地面站下发本轮任务模式。只在 WAIT_MODE（上电待命）时采信，已起飞/进行中忽略，避免误切。
+  std::string s;
+  for (char c : msg->data) {
+    if (!std::isspace(static_cast<unsigned char>(c))) s += static_cast<char>(std::tolower(c));
+  }
+  MissionMode requested;
+  if (s == "directed")      requested = MissionMode::DIRECTED;
+  else if (s == "traverse") requested = MissionMode::TRAVERSE;
+  else {
+    RCLCPP_WARN(get_logger(), "收到无法识别的任务模式 '%s'（应为 traverse/directed），忽略。",
+                msg->data.c_str());
+    return;
+  }
+
+  if (phase_ != MissionPhase::WAIT_MODE) {
+    RCLCPP_WARN(get_logger(), "已开始任务（非待命态），忽略地面站模式切换 '%s'。", s.c_str());
+    return;
+  }
+
+  active_mode_ = requested;
+  mode_str_ = s;
+  RCLCPP_INFO(get_logger(), "地面站下发任务模式：%s，开始配置航线。", s.c_str());
+  configureForMode();
+}
+
+void InventoryMissionNode::configureForMode()
+{
+  // 按 active_mode_ 建航线并设初始相位。比赛模式由 WAIT_MODE 收到模式后调用；rotate_test 启动即调。
+  if (active_mode_ == MissionMode::TRAVERSE) {
+    buildTraverseWaypoints();
+    current_idx_ = 0;
+    phase_ = MissionPhase::TAKEOFF;
+  } else if (active_mode_ == MissionMode::ROTATE_TEST) {
+    buildRotateTestWaypoints();
+    current_idx_ = 0;
+    phase_ = MissionPhase::TAKEOFF;
+  } else {
+    // DIRECTED：先在地面识别抽取码，识别成功后再 buildDirectedWaypoints。
+    phase_ = MissionPhase::IDENTIFY;
+  }
+  RCLCPP_INFO(get_logger(), "航线配置完成，mode=%s，航点数=%zu",
+              mode_str_.c_str(), waypoints_.size());
+}
+
 // ───────────────────────────── 主循环
 void InventoryMissionNode::monitorTimerCallback()
 {
-  // 头一拍先把控制器使能 + uart 开门发出去
-  if (!first_publish_done_) {
+  // 先发状态/心跳（含 WAIT_MODE，让地面站一上来就知道飞机已起好、正在待命）。
+  publishStatus();
+
+  // WAIT_MODE：上电待命，**不接管控制器、不发目标、不起飞**，纯等地面站 /inventory_mode。
+  // （比赛模式飞机重启后停在这里，autostart 上电不会乱起飞——modeCommandCallback 收到才离开。）
+  if (phase_ == MissionPhase::WAIT_MODE) {
+    return;
+  }
+
+  // 真正要起飞那拍才接管控制器 + uart 开门（推迟到此，待命期间不接管飞控）。
+  // ⚠ 定向(DIRECTED)模式离开 WAIT_MODE 先进 IDENTIFY 在地面读抽取码、等地面站下发货位，
+  //   这段可能好几秒~十几秒，期间**不能**接管——否则位置 PID 已在跑却没有效目标点(用默认0,0,0)
+  //   可能让飞机在地面乱动。故排除 IDENTIFY：等识别完进入 TAKEOFF 那拍(有航点了)再接管。
+  //   遍历(TRAVERSE)/旋转测试离开待命直接是 TAKEOFF，行为不变、第一拍即接管。
+  if (!first_publish_done_ && phase_ != MissionPhase::IDENTIFY) {
     std_msgs::msg::UInt8 ctl; ctl.data = 2;          // 位置控制器接管
     active_controller_pub_->publish(ctl);
     std_msgs::msg::UInt8 rc; rc.data = 1;            // uart 开门转发速度
@@ -209,7 +304,9 @@ void InventoryMissionNode::monitorTimerCallback()
   }
 
   const InventoryWaypoint & wp = waypoints_[current_idx_];
-  publishTarget(wp);
+  // 超时补救中：目标改为后退点（远离板面），其余货位/正常态仍发原航点。
+  const InventoryWaypoint tgt = retreat_in_progress_ ? retreatWaypoint(wp) : wp;
+  publishTarget(tgt);
 
   double x_cm, y_cm, yaw_deg;
   if (!getCurrentPose(x_cm, y_cm, yaw_deg)) {
@@ -218,23 +315,54 @@ void InventoryMissionNode::monitorTimerCallback()
   double z_cm;
   { std::lock_guard<std::mutex> lk(mutex_); z_cm = current_height_cm_; }
 
-  if (!isReached(wp, x_cm, y_cm, z_cm, yaw_deg)) {
-    return;  // 未到点，继续逼近
+  if (!isReached(tgt, x_cm, y_cm, z_cm, yaw_deg)) {
+    return;  // 未到点（含飞向后退点途中），继续逼近
   }
 
   // 到点。盘点航点要跑盘点子状态；过渡航点直接推进。
   if (wp.scan) {
     if (!scan_active_) {
-      scan_active_ = true;
-      scan_start_time_ = now();
+      // 本货位是否由升/降进入（与上一航点高度不同）→ 决定 qr_vision 是否额外卡纵向：
+      // 换行下降/上升才开 strict_vertical（避免下降途中横向恰对正就提前打激光）；
+      // 同一行内同高度横移则不开，行为与旧版完全一致。
+      // 后退重试时（retreat_in_progress_）若开了 tighten_laser_on_retreat_ 也强制收严。
+      const bool vertical_entry =
+        current_idx_ > 0 &&
+        std::fabs(wp.z_cm - waypoints_[current_idx_ - 1].z_cm) > vertical_entry_tol_cm_;
+      const bool strict = vertical_entry ||
+                          (retreat_in_progress_ && tighten_laser_on_retreat_);
       scan_qr_aligned_ = false;
       has_qr_id_ = false;
-      publishQrEnable(true);   // 开识别+激光
+      scan_laser_fired_ = false;
+      scan_active_ = true;
+      scan_start_time_ = now();
+      publishStrictVertical(strict);          // 先发严判开关，再开识别
+      publishQrEnable(true);                  // 开识别+激光
     }
-    if (runScanAtWaypoint()) {
+    const ScanOutcome oc = runScanAtWaypoint();
+    if (oc == ScanOutcome::RECORDED) {
       publishQrEnable(false);
+      publishStrictVertical(false);
       scan_active_ = false;
-      advance();
+      advance();                              // advance() 内重置 retreat 状态
+    } else if (oc == ScanOutcome::TIMED_OUT) {
+      if (scan_retreat_cm_ > 0.0 && !scan_retreated_) {
+        // 第一次超时 → 后退 scan_retreat_cm 重试（离板远些好解码）。
+        scan_retreated_ = true;
+        retreat_in_progress_ = true;
+        scan_active_ = false;                 // 飞到后退点后会重新 init 扫描
+        publishQrEnable(false);               // 飞过去途中先关，避免半路乱打
+        publishStrictVertical(false);
+        RCLCPP_WARN(get_logger(), "货位 %s 超时，后退 %.0fcm 重试识别。",
+                    wp.slot.c_str(), scan_retreat_cm_);
+      } else {
+        // 已退过仍超时（或关闭了后退）→ 放弃跳过，避免卡死整套。
+        RCLCPP_WARN(get_logger(), "货位 %s 重试仍超时，跳过。", wp.slot.c_str());
+        publishQrEnable(false);
+        publishStrictVertical(false);
+        scan_active_ = false;
+        advance();
+      }
     }
   } else {
     advance();
@@ -242,18 +370,21 @@ void InventoryMissionNode::monitorTimerCallback()
 }
 
 // ───────────────────────────── 盘点子状态
-bool InventoryMissionNode::runScanAtWaypoint()
+ScanOutcome InventoryMissionNode::runScanAtWaypoint()
 {
   const double elapsed = (now() - scan_start_time_).seconds();
   if (elapsed < scan_settle_sec_) {
-    return false;  // 先稳一下再判定
+    return ScanOutcome::WAITING;  // 先稳一下再判定
   }
 
-  bool aligned, has_id; std::string id;
+  bool fired; std::string id;
   { std::lock_guard<std::mutex> lk(mutex_);
-    aligned = scan_qr_aligned_; has_id = has_qr_id_; id = latest_qr_id_; }
+    fired = scan_laser_fired_; id = scan_laser_id_; }
 
-  if (aligned && has_id) {
+  // 完成判据 = qr_vision 回报“激光已打满 0.5s”（/qr_vision/laser_fired），而非松的 aligned。
+  // 激光只在横向(及换行时纵向)都进窗才打 → 顺序恒为 对正→打满激光→记录→推进，
+  // 不会还没打准就提前飞向下一个货位（修 24fly 下降途中提前识别/打偏的老 bug）。
+  if (fired) {
     const int cargo = parseCargoId(id);
     const std::string & slot = waypoints_[current_idx_].slot;
     recordInventory(slot, cargo);
@@ -265,15 +396,24 @@ bool InventoryMissionNode::runScanAtWaypoint()
     std_msgs::msg::Empty led; inventory_led_pub_->publish(led);  // 地面站 LED 亮灭一次
 
     RCLCPP_INFO(get_logger(), "盘点 %s -> 货物编号 %d", slot.c_str(), cargo);
-    return true;
+    return ScanOutcome::RECORDED;
   }
 
   if (elapsed > scan_timeout_sec_) {
-    RCLCPP_WARN(get_logger(), "货位 %s 盘点超时，跳过。",
-                waypoints_[current_idx_].slot.c_str());
-    return true;  // 超时也推进，避免整套卡死
+    return ScanOutcome::TIMED_OUT;  // 交由上层决定后退重试还是跳过
   }
-  return false;
+  return ScanOutcome::WAITING;
+}
+
+// 后退点：沿机头反方向后撤 scan_retreat_cm。相机/激光/机头都朝板面，故板面在 +机头方向，
+// 后撤=-(cos yaw, sin yaw)。yaw0(A/C)→x减小；yaw180(B/D)→x增大。y/z 保持不变（只改 standoff）。
+InventoryWaypoint InventoryMissionNode::retreatWaypoint(const InventoryWaypoint & wp) const
+{
+  InventoryWaypoint r = wp;
+  const double yaw_rad = wp.yaw_deg * M_PI / 180.0;
+  r.x_cm = wp.x_cm - std::cos(yaw_rad) * scan_retreat_cm_;
+  r.y_cm = wp.y_cm - std::sin(yaw_rad) * scan_retreat_cm_;
+  return r;
 }
 
 // ───────────────────────────── DIRECTED：地面识别抽取码
@@ -346,13 +486,24 @@ struct FaceGeometry
 FaceGeometry faceGeometry(char face)
 {
   switch (face) {
-    case 'A': return {  0.0,   0.0, {{ 70.0, 123.0, 173.0}}, 129.0, 90.0, true};
-    case 'B': return {150.0, 180.0, {{ 75.0, 128.0, 178.0}}, 133.0, 91.0, true};
-    // TODO(标定)：货架2 C/D 实测后替换占位，measured 改 true。
-    case 'C': return {300.0,   0.0, {{ 70.0, 123.0, 173.0}}, 129.0, 90.0, false};
-    case 'D': return {450.0, 180.0, {{ 75.0, 128.0, 178.0}}, 133.0, 91.0, false};
+    case 'A': return { 30.0,   0.0, {{ 70.0, 123.0, 173.0}}, 129.0, 90.0, true};
+    case 'B': return {120.0, 180.0, {{ 75.0, 128.0, 178.0}}, 133.0, 91.0, true};
+    // 货架2（2026-06-05 实测）：板≈x275，C 面 x230 朝+x、D 面 x320 朝-x。
+    case 'C': return {230.0,   0.0, {{ 71.0, 123.0, 174.0}}, 132.0, 90.0, true};
+    case 'D': return {320.0, 180.0, {{ 75.0, 127.0, 178.0}}, 132.0, 91.0, true};
     default:  return {  0.0,   0.0, {{ 70.0, 123.0, 173.0}}, 129.0, 90.0, false};
   }
+}
+
+// 单货位 y 实测微调（cm）：faceGeometry 的 y 按"列"存、被同列高/低两货位共用，
+// 这里覆盖个别货位的 y 偏差（实飞复核后单独调），不影响同列另一个货位。
+//   D1：实飞激光偏，单独 -3（同列的 D4 不动）。
+double slotYAdjustCm(const std::string & slot)
+{
+  // 遍历 D 面扫描顺序 D4,D5,D6,D3,D2,D1 → 倒数第二=D2、倒数第一=D1（实飞复核单独微调）。
+  if (slot == "D2") return -6.0;   // 倒数第二个：y 减小 6（同列 D5 不动）
+  if (slot == "D1") return -6.0;   // 倒数第一个：原 -3 再减小 3 → -6（同列 D4 不动）
+  return 0.0;
 }
 }  // namespace
 
@@ -360,8 +511,9 @@ InventoryWaypoint InventoryMissionNode::slotToScanWaypoint(const std::string & s
 {
   // slot = 面字符(A/B/C/D) + 货位号(1..6)，如 "C5"。
   // 货位编号约定：idx 1/2/3 = 高行 列0/1/2，idx 4/5/6 = 低行 列0/1/2（列按 y 递增）。
-  // ⚠ 货位号↔真实二维码的对应仍待标定（B/D 背面尤其要核），但**飞机观测坐标**已是实测值，
-  //   遍历/定向直飞共用此函数，保证两者落点一致。
+  // ✅ 货位号↔码对应已确认（2026-06-05，四面统一、无镜像）：上排=1/2/3(高z)、下排=4/5/6(低z)；
+  //   同排按飞机观测 y：y 小→1,4 / y 中→2,5 / y 大→3,6。B/D 背面虽转 180°，但按飞机观测 y 算
+  //   （非相机画面左右），同规律成立，无需镜像。遍历/定向直飞共用此函数，保证两者落点一致。
   const char face = slot.empty() ? 'A' : slot[0];
   int idx = 1;
   try { idx = std::stoi(slot.substr(1)); } catch (...) { idx = 1; }
@@ -373,7 +525,7 @@ InventoryWaypoint InventoryMissionNode::slotToScanWaypoint(const std::string & s
 
   InventoryWaypoint wp;
   wp.x_cm    = geo.x_cm;
-  wp.y_cm    = geo.col_y_cm[col];
+  wp.y_cm    = geo.col_y_cm[col] + slotYAdjustCm(slot);  // 个别货位 y 单独微调（如 D1 -3）
   wp.z_cm    = (row == 0) ? geo.z_high_cm : geo.z_low_cm;
   wp.yaw_deg = geo.yaw_deg;
   wp.scan    = true;
@@ -412,12 +564,12 @@ void InventoryMissionNode::buildTraverseWaypoints()
     const bool high_first = (fi % 2 == 0);
     const double first_z = high_first ? geo.z_high_cm : geo.z_low_cm;
 
-    // 换面过渡（除第一面外）：先回 y 轴、再平移到位、最后原地旋转，分三步避免边走边转。
+    // 换面过渡（除第一面外）：先回过渡 y(退离板面)、再平移到位、最后原地旋转，分三步避免边走边转。
     if (fi > 0) {
       const FaceGeometry prev = faceGeometry(traverse_faces_[fi - 1][0]);
-      waypoints_.push_back({prev.x_cm, home_y_cm_, first_z, prev.yaw_deg, false, "", "return_axis"});
-      waypoints_.push_back({geo.x_cm,  home_y_cm_, first_z, prev.yaw_deg, false, "", "transit"});
-      waypoints_.push_back({geo.x_cm,  home_y_cm_, first_z, geo.yaw_deg,  false, "", "rotate"});
+      waypoints_.push_back({prev.x_cm, transit_y_cm_, first_z, prev.yaw_deg, false, "", "return_axis"});
+      waypoints_.push_back({geo.x_cm,  transit_y_cm_, first_z, prev.yaw_deg, false, "", "transit"});
+      waypoints_.push_back({geo.x_cm,  transit_y_cm_, first_z, geo.yaw_deg,  false, "", "rotate"});
     }
 
     // 本面 6 个 scan 航点：先扫行 列0→2（y 递增），后扫行 列2→0（y 递减）。
@@ -430,29 +582,53 @@ void InventoryMissionNode::buildTraverseWaypoints()
       waypoints_.push_back(slotToScanWaypoint(face + std::to_string(second_base + c)));
   }
 
-  // 返航 + 降落。本轮（货架1 两面测试）在最后一面正前方的 y 轴上降落（终点=最后面 x, y=home）。
-  // TODO(正式赛)：四面全跑时降落点应为黑圆 land_x_cm_/land_y_cm_，标定后切回。
+  // 返航 + 降落。
   const FaceGeometry last = faceGeometry(traverse_faces_.back()[0]);
   const bool last_high_first = ((traverse_faces_.size() - 1) % 2 == 0);
   const double end_z = last_high_first ? last.z_low_cm : last.z_high_cm;  // 末面收尾行高度
-  waypoints_.push_back({last.x_cm, home_y_cm_, end_z,           last.yaw_deg, false, "", "return"});
-  waypoints_.push_back({last.x_cm, home_y_cm_, land_height_cm_, last.yaw_deg, false, "", "land"});
+  if (land_at_circle_) {
+    // 要求1 四面全跑：末面(D,x320)收尾后已在货架2 外侧、平移到黑圆不会撞板，故不再退 y 轴，
+    // 直接保持末面收尾高度平移到黑圆上空，最后垂直降落。
+    waypoints_.push_back({land_x_cm_, land_y_cm_, end_z,           last.yaw_deg, false, "", "return"});
+    waypoints_.push_back({land_x_cm_, land_y_cm_, land_height_cm_, last.yaw_deg, false, "", "land"});
+  } else {
+    // 单货架测试（traverse_faces:=A,B）：在最后一面正前方的 y 轴上降落（终点=最后面 x, y=home）。
+    waypoints_.push_back({last.x_cm, home_y_cm_, end_z,           last.yaw_deg, false, "", "return"});
+    waypoints_.push_back({last.x_cm, home_y_cm_, land_height_cm_, last.yaw_deg, false, "", "land"});
+  }
 }
 
 void InventoryMissionNode::buildDirectedWaypoints(const std::string & target_slot)
 {
   waypoints_.clear();
-  waypoints_.push_back({home_x_cm_, home_y_cm_, flight_height_cm_, 0.0,
-                        false, "", "takeoff"});
 
-  // 地面站已下发货位 → 用与遍历完全相同的几何映射到航点，直飞该货位盘点。
-  // （二维码位置固定，slotToScanWaypoint 给出标称坐标，细微偏差由 qr_fine_tune 微调。）
+  // 地面站已下发货位 → 用与遍历完全相同的几何映射到航点（二维码位置固定，slotToScanWaypoint
+  // 给标称坐标，细微偏差由 qr_fine_tune 微调）。
   InventoryWaypoint scan = slotToScanWaypoint(target_slot);
   scan.tag = "scan_directed";
+
+  // ⚠ 不能直线 home→货位→黑圆：那条返航直线会斜穿货架板（差点撞板）。
+  //   关键事实：飞机所在的这一列 x 上没有板子（板在 x75/x275，飞机在 x30/120/230/320，离板~45cm）。
+  //   故进出都「沿飞机自己这一列 y 方向滑动」越过板子尾端 + 在板子远侧空旷走廊(y=directed_return_y)横移，
+  //   全程不穿板，且不回头绕远。z 全程保持盘点高度 scan.z，只在最后落点降下来（不必反复升降）。
+  //
+  //   去程：home 起飞到 scan.z → 沿 y=home_y 横移到本列 → 原地转向 → 沿本列爬进货位
+  //   回程：沿本列爬到远侧走廊 y=directed_return_y → 横移到降落 x(板外) → 到黑圆上空 → 垂直降落
+
+  // 1) 起飞：home 上空升到盘点高度（yaw 0）
+  waypoints_.push_back({home_x_cm_, home_y_cm_, scan.z_cm, 0.0, false, "", "takeoff"});
+
+  // 2) 沿 y=home_y 走廊横移到本列 → 原地转到该面朝向 → 沿本列爬进货位盘点（全程 z=scan.z）
+  waypoints_.push_back({scan.x_cm, home_y_cm_, scan.z_cm, 0.0,          false, "", "transit"});
+  waypoints_.push_back({scan.x_cm, home_y_cm_, scan.z_cm, scan.yaw_deg, false, "", "rotate"});
   waypoints_.push_back(scan);
 
-  waypoints_.push_back({land_x_cm_, land_y_cm_, flight_height_cm_, 0.0, false, "", "return"});
-  waypoints_.push_back({land_x_cm_, land_y_cm_, land_height_cm_, 0.0, false, "", "land"});
+  // 3) 返航：沿本列爬到远侧走廊 y=directed_return_y(板外空旷) → 横移到降落 x → 到黑圆上空 → 降落。
+  //    z 一路保持 scan.z，到黑圆正上方才垂直降落。
+  waypoints_.push_back({scan.x_cm,  directed_return_y_cm_, scan.z_cm,       scan.yaw_deg, false, "", "return_axis"});
+  waypoints_.push_back({land_x_cm_, directed_return_y_cm_, scan.z_cm,       0.0,          false, "", "transit"});
+  waypoints_.push_back({land_x_cm_, land_y_cm_,            scan.z_cm,       0.0,          false, "", "return"});
+  waypoints_.push_back({land_x_cm_, land_y_cm_,            land_height_cm_, 0.0,          false, "", "land"});
 }
 
 void InventoryMissionNode::buildRotateTestWaypoints()
@@ -509,14 +685,78 @@ void InventoryMissionNode::publishTarget(const InventoryWaypoint & wp)
   target_pub_->publish(msg);
 }
 
+std::string InventoryMissionNode::buildStatusText() const
+{
+  // 模式中文标签
+  std::string m;
+  switch (active_mode_) {
+    case MissionMode::TRAVERSE:    m = "遍历"; break;
+    case MissionMode::DIRECTED:    m = "定向"; break;
+    case MissionMode::ROTATE_TEST: m = "旋转测试"; break;
+  }
+
+  if (phase_ == MissionPhase::WAIT_MODE) {
+    return "待命中：等地面站下发任务模式（普通/进阶）";
+  }
+  if (phase_ == MissionPhase::IDENTIFY) {
+    if (!target_identified_) return "[定向] 识别抽取码中…（请把抽取码举到机头相机前）";
+    if (!has_target_slot_)
+      return "[定向] 已识别抽取码 编号" + std::to_string(target_cargo_id_) + "，等地面站下发货位";
+    return "[定向] 已收到货位 " + target_slot_ + "，准备起飞";
+  }
+  if (phase_ == MissionPhase::DONE) {
+    return "[" + m + "] 任务完成";
+  }
+  // 飞行中：按当前航点 tag/slot 给出可读阶段
+  if (current_idx_ < waypoints_.size()) {
+    const InventoryWaypoint & wp = waypoints_[current_idx_];
+    const std::string t(wp.tag ? wp.tag : "");
+    if (wp.scan)
+      return "[" + m + "] 盘点中 货位" + wp.slot +
+             (retreat_in_progress_ ? "（后退重试）" : "");
+    if (t == "takeoff")     return "[" + m + "] 起飞中";
+    if (t == "return")      return "[" + m + "] 返航中";
+    if (t == "land")        return "[" + m + "] 降落中";
+    if (t == "rotate")      return "[" + m + "] 转向对面中";
+    if (t == "transit" || t == "return_axis") return "[" + m + "] 换面飞行中";
+    return "[" + m + "] 飞行中";
+  }
+  return "[" + m + "] 飞行中";
+}
+
+void InventoryMissionNode::publishStatus()
+{
+  const std::string text = buildStatusText();
+  const rclcpp::Time t = now();
+  // 内容变了立刻发；否则每 ~0.5s 发一次充当心跳（地面站断流 >N 秒即判离线）。
+  if (status_inited_ && text == last_status_text_ &&
+      (t - last_status_pub_time_).seconds() < 0.5) {
+    return;
+  }
+  std_msgs::msg::String msg; msg.data = text;
+  inventory_status_pub_->publish(msg);
+  last_status_text_ = text;
+  last_status_pub_time_ = t;
+  status_inited_ = true;
+}
+
 void InventoryMissionNode::publishQrEnable(bool on)
 {
   std_msgs::msg::Bool msg; msg.data = on;
   qr_enable_pub_->publish(msg);
 }
 
+void InventoryMissionNode::publishStrictVertical(bool on)
+{
+  std_msgs::msg::Bool msg; msg.data = on;
+  qr_strict_vertical_pub_->publish(msg);
+}
+
 void InventoryMissionNode::advance()
 {
+  // 后退补救是“逐货位”的：推进到下一个航点即复位，下一个货位从正常 standoff 重新开始。
+  scan_retreated_ = false;
+  retreat_in_progress_ = false;
   ++current_idx_;
   // 根据下一航点 tag 粗略更新 phase（仅用于日志/外部观测）
   if (current_idx_ < waypoints_.size()) {

@@ -9,9 +9,10 @@
 #        - 关键话题录 rosbag（事后回放/画曲线）
 #        - 收到停止信号时让 bag 正常写完 metadata
 #
-# 默认起「QR→激光」链路测试（qr_vision + uart_to_stm32，复用植保 /electromagnet_control 链路）。
-# 想换 launch / 包：
-#   AUTOSTART_PKG=inventory_control_pkg AUTOSTART_LAUNCH=inventory_mission.launch.py ./autostart_fly.sh
+# 默认起「要求1 整套基础部分」inventory_full（飞控底座 carto+uart+位置PID + 视觉 + 任务，
+# A,B,C,D 四面遍历 + 落黑圆）。⚠ 这会上电即起飞控并进入起飞→遍历流程，现场务必确认安全/可随时接管。
+# 想换 launch / 包（例：只起 QR→激光链路调试，不飞）：
+#   AUTOSTART_PKG=inventory_control_pkg AUTOSTART_LAUNCH=qr_laser_test.launch.py ./autostart_fly.sh
 #
 # 产物（默认 ~/fly_logs/）：
 #   autostart_<时间戳>.log   开机自启外层日志（含 source/环境信息）
@@ -31,23 +32,29 @@ mkdir -p "$LOG_DIR"
 TS="$(date +%Y%m%d_%H%M%S)"
 AUTO_LOG="$LOG_DIR/autostart_${TS}.log"
 
-LAUNCH_PKG="${AUTOSTART_PKG:-inventory_control_pkg}"
-LAUNCH_FILE="${AUTOSTART_LAUNCH:-qr_laser_test.launch.py}"
+LAUNCH_PKG="${AUTOSTART_PKG:-my_launch}"
+LAUNCH_FILE="${AUTOSTART_LAUNCH:-inventory_full.launch.py}"
 
 # ---- 要录的话题（D 题盘点排查用，见开发笔记）----
 TOPICS=(
-  /qr_vision/id            # 识别到的二维码编号 "1".."24"
+  /qr_vision/id            # 识别到的二维码编号 "1".."24"（=摄像头识别到没）
   /qr_vision/offset_norm   # 归一化像素偏移 x=ex(右正)/y=ey(下正)
-  /qr_vision/aligned       # 是否已对准中心（激光改香橙派 GPIO 直驱，不在话题上）
+  /qr_vision/aligned       # 是否已对准中心
+  /qr_vision/laser_fired   # 激光打满 0.5s 后回报刚打的码（=激光有没有打，§10）
+  /qr_vision/strict_vertical # 换行升/降时的纵向严判开关状态（§10）
   /qr_vision/enable        # 识别+激光总开关（mission 到位才开）
   /inventory_result        # 逐货位上报 编号=N,货位=XY（建表/LCD）
   /inventory_led           # 每盘一个 LED 亮灭
   /inventory_target        # 定向盘点抽取码编号/确认
   /inventory_target_slot   # 地面站下发货位 "C5"
+  /inventory_status        # 飞机状态/心跳文本（待命/识别/盘点到哪步，地面站顶栏显示）
+  /inventory_mode          # 地面站下发本轮任务模式 traverse/directed（飞机重启后据此起飞）
   /standoff/distance       # 雷达测板面距离 cm（standoff 闭环）
   /height                  # STM32 上报离地高度 cm（z 反馈）
   /target_position         # mission 下发目标点 [x,y,z,yaw]
   /mission_step            # STM32 回传任务步
+  /target_velocity         # PID→飞控 目标速度(0x31)，复核 yaw180 机体系旋转(§9.3)
+  /velocity_map            # 当前速度反馈(0x32)
 )
 
 # ---- 收尾：让 bag 正常落 metadata ----

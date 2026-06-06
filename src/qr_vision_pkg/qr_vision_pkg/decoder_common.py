@@ -74,6 +74,12 @@ class QRVisionNode(Node):
         self.declare_parameter("eps_x", 0.40)             # 对准判定横向阈值（归一化）
         self.declare_parameter("eps_y", 0.40)             # 对准判定纵向阈值
         self.declare_parameter("eps_x_laser", 0.25)       # 触发激光的更严横向阈值
+        # 触发激光的更严纵向阈值，**仅在 strict_vertical=True 时生效**（见 /qr_vision/strict_vertical）。
+        # 背景：高行→低行是同一 y 的纯下降，横向(ex)全程对正、码一能解码 ex 就进窗；若不卡 ey，
+        # 会在还没降到该货位高度中心时就提前打激光（24fly 老 bug，激光打不准）。但同一行内是同高度
+        # 横移、纵向本就到位，再卡 ey 反而可能（相机/激光不完全共轴时）打不出激光。故只在“刚升/降
+        # 进入该货位”那一次扫描由任务节点把 strict_vertical 置 True，平时 False（行为与旧版完全一致）。
+        self.declare_parameter("eps_y_laser", 0.25)       # 触发激光的更严纵向阈值（strict_vertical 时才用）
         self.declare_parameter("stable_frames", 1)        # 连续 N 帧在窗内才算 aligned
         self.declare_parameter("enable_debug_image", False)
         self.declare_parameter("enable_gui", False)
@@ -95,6 +101,7 @@ class QRVisionNode(Node):
         self.eps_x = self.get_parameter("eps_x").value
         self.eps_y = self.get_parameter("eps_y").value
         self.eps_x_laser = self.get_parameter("eps_x_laser").value
+        self.eps_y_laser = self.get_parameter("eps_y_laser").value
         self.stable_frames = self.get_parameter("stable_frames").value
         self.enable_debug = self.get_parameter("enable_debug_image").value
         self.enable_gui = self.get_parameter("enable_gui").value
@@ -116,6 +123,9 @@ class QRVisionNode(Node):
         self.qr_id_pub = self.create_publisher(String, f"{self.topic_prefix}/id", 10)
         self.offset_pub = self.create_publisher(Point, f"{self.topic_prefix}/offset_norm", 10)
         self.aligned_pub = self.create_publisher(Bool, f"{self.topic_prefix}/aligned", 10)
+        # 激光真打完（亮满 0.5s 再灭）后发一次，内容=刚打的码。任务节点据此判“本货位已真打激光”
+        # 才记录+推进，保证顺序 对正→打满0.5s→记录→飞走，不会还没打就提前飞向下一个。
+        self.laser_fired_pub = self.create_publisher(String, f"{self.topic_prefix}/laser_fired", 10)
         self.image_pub = self.create_publisher(Image, f"{self.topic_prefix}/debug_image", 10)
         # 可选的植保电磁铁链路（默认关）：/electromagnet_control(UInt8 1=开/0=关)→uart_to_stm32→0x33
         self.electromagnet_pub = (
@@ -126,6 +136,11 @@ class QRVisionNode(Node):
         self.detect_enabled = True
         self.enable_sub = self.create_subscription(
             Bool, "/qr_vision/enable", self._on_enable, 10)
+        # 纵向严判开关：任务节点只在“刚升/降进入该货位”那一次扫描置 True（见 eps_y_laser 注释），
+        # 平时 False → 激光只卡横向(ex)，与旧版同高度扫描行为完全一致。
+        self.strict_vertical = False
+        self.strict_vertical_sub = self.create_subscription(
+            Bool, "/qr_vision/strict_vertical", self._on_strict_vertical, 10)
 
         self.bridge = CvBridge()
 
@@ -173,9 +188,10 @@ class QRVisionNode(Node):
                 f"GPIO 初始化失败(权限? 需 root 或把用户加进 gpio 组): {e} → laser_pin 置 -1")
             self.laser_pin = -1
 
-    def _fire_laser_worker(self):
+    def _fire_laser_worker(self, qr_data: str = ""):
         """子线程：激光亮 0.5s 再灭，不阻塞识别主循环。
-        主链路 = 香橙派 WiringOP `gpio write`（laser_on_level=亮）；use_electromagnet 时再走植保话题。"""
+        主链路 = 香橙派 WiringOP `gpio write`（laser_on_level=亮）；use_electromagnet 时再走植保话题。
+        亮灭完整 0.5s 后发 {prefix}/laser_fired(=qr_data)，任务节点据此判“已真打满激光”再推进。"""
         try:
             self.get_logger().info(f"==> 激光发射! (Pin {self.laser_pin})")
             if self.laser_pin != -1:
@@ -188,12 +204,26 @@ class QRVisionNode(Node):
             if self.electromagnet_pub is not None:
                 self.electromagnet_pub.publish(UInt8(data=0))
             self.get_logger().info("==> 激光关闭")
+            # 打满 0.5s 才确认（发在最后）：任务节点等到这条才记录+推进 → 激光脉冲全程飞机仍悬停在该货位。
+            self.laser_fired_pub.publish(String(data=qr_data))
         except Exception as e:
             self.get_logger().error(f"激光发射失败: {e}")
 
     # ------------------------------------------------------ 动态控制
     def _on_enable(self, msg: Bool):
-        self.detect_enabled = bool(msg.data)
+        on = bool(msg.data)
+        # 上升沿(关→开)=任务节点开始一次新货位扫描 → 复位“上次打激光的码”等状态。
+        # 否则 previous_qr_data 跨货位残留：定向盘点目标码 == 地面刚识别的抽取码（同一数字），
+        # 到货位后因 qr_data==previous_qr_data 被去重挡住、激光永不触发 → 一直识别不到直到超时。
+        # 每次扫描复位后，即使前后是同一个码也能重新对准打激光（遍历各码不同本就无碍）。
+        if on and not self.detect_enabled:
+            self.previous_qr_data = ""
+            self.last_qr_id = ""
+            self.stable_count = 0
+        self.detect_enabled = on
+
+    def _on_strict_vertical(self, msg: Bool):
+        self.strict_vertical = bool(msg.data)
 
     def _update_window_status(self):
         has_display = os.environ.get("DISPLAY") is not None
@@ -218,15 +248,18 @@ class QRVisionNode(Node):
         if not ret:
             return
 
-        # 关闭识别时只读帧清缓冲，不解码不打激光
-        if not self.detect_enabled:
-            self.stable_count = 0
-            return
-
+        # 先转正，保证预览/调试图方向正确（无论在不在识别都先转）。
         if self.rotate_code in (cv2.ROTATE_90_CLOCKWISE,
                                 cv2.ROTATE_180,
                                 cv2.ROTATE_90_COUNTERCLOCKWISE):
             frame = cv2.rotate(frame, self.rotate_code)
+
+        # 关闭识别时只读帧清缓冲，不解码不打激光——但仍出预览/调试图：
+        # 上电待命(WAIT_MODE)/航点间也能看到相机画面，用来确认自启动与相机正常。
+        if not self.detect_enabled:
+            self.stable_count = 0
+            self._render_output(frame, status="STANDBY (detect off)")
+            return
 
         self.frame_count += 1
         img_h, img_w = frame.shape[:2]
@@ -255,7 +288,11 @@ class QRVisionNode(Node):
 
             if abs(ex) < self.eps_x and abs(ey) < self.eps_y:
                 self.stable_count += 1
+                # 激光横向必进窗；纵向(ey)只在 strict_vertical（刚升/降进货位）时也卡，
+                # 避免下降途中横向恰对正就提前打。同高度横移时 strict_vertical=False，只卡横向。
                 laser_ready = abs(ex) < self.eps_x_laser
+                if self.strict_vertical:
+                    laser_ready = laser_ready and abs(ey) < self.eps_y_laser
             else:
                 self.stable_count = 0
                 laser_ready = False
@@ -263,7 +300,8 @@ class QRVisionNode(Node):
             aligned = self.stable_count >= self.stable_frames
 
             if laser_ready and qr_data != self.previous_qr_data:
-                threading.Thread(target=self._fire_laser_worker, daemon=True).start()
+                threading.Thread(target=self._fire_laser_worker,
+                                 args=(qr_data,), daemon=True).start()
                 self.previous_qr_data = qr_data
 
             self.qr_id_pub.publish(String(data=qr_data))
@@ -281,12 +319,19 @@ class QRVisionNode(Node):
 
         self.aligned_pub.publish(Bool(data=bool(aligned)))
 
+        self._render_output(frame, status="SCANNING")
+
+    def _render_output(self, frame, status: str = "") -> None:
+        """统一出图：调试图话题 + 本地预览窗。识别关闭时也调用 → 相机画面持续可见，
+        便于现场确认自启动跑起来、相机工作正常（不再因 detect 关闭而黑屏）。"""
+        if status and (self.enable_debug or self.should_show_window):
+            cv2.putText(frame, status, (10, 28), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 255, 255), 2)
         if self.enable_debug:
             try:
                 self.image_pub.publish(self.bridge.cv2_to_imgmsg(frame, "bgr8"))
             except Exception:
                 pass
-
         if self.should_show_window:
             try:
                 cv2.imshow(self.get_name(), frame)

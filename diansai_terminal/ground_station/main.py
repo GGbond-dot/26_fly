@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from typing import Any
 
 # The ground station is a pure QWidget UI. On Orange Pi/Rockchip desktop
@@ -352,11 +353,18 @@ class WarehouseMap(QWidget):
         landing: dict[str, float],
         waypoint: Waypoint,
     ) -> list[QPointF]:
+        # 大致复刻飞机绕板：出去沿起飞侧底边滑到本列、沿本列爬进货位；
+        # 回来沿本列继续爬到板子外侧的空走廊(return_y)，再在走廊里横移到降落点 ——
+        # 不在货位高度直接横穿货架(那条横线会戳穿 x=1.5/3.5 的板)。
+        racks = self.config["warehouse"].get("racks", [])
+        board_ymax = max((float(r.get("y_max", 0.0)) for r in racks), default=0.0)
+        return_y = max(float(landing["y"]), board_ymax + 0.2)
         route = [
             (float(takeoff["x"]), float(takeoff["y"])),
             (waypoint.x, float(takeoff["y"])),
             (waypoint.x, waypoint.y),
-            (float(landing["x"]), waypoint.y),
+            (waypoint.x, return_y),
+            (float(landing["x"]), return_y),
             (float(landing["x"]), float(landing["y"])),
         ]
         compact: list[tuple[float, float]] = []
@@ -416,7 +424,16 @@ class GroundStationWindow(QMainWindow):
         self.config = load_waypoint_config()
         self.waypoints = waypoint_map(self.config)
         self.store = InventoryStore()
+        # 重启一律清空：每次启动地面站都从干净状态开始（覆盖上轮落盘 inventory_state.json）。
+        # 要求1→要求2 之间地面站保持运行、只重启飞机，要求2 靠内存里的「编号→货位」表，
+        # 不依赖重启重载；所以重启=开新一轮，清空避免上轮旧结果残留误导。
+        self.store.clear_results()
         self.bridge = RosBridge()
+
+        # 飞机心跳：最近一次收到 /inventory_status 的时刻 + 文本。超时未收到即判离线。
+        self._uav_last_seen: float | None = None
+        self._uav_status_text = "--"
+        self._uav_offline_sec = 2.5      # 超过这么久没心跳 → 显示离线
 
         self._build_ui()
         self._connect_bridge()
@@ -456,11 +473,18 @@ class GroundStationWindow(QMainWindow):
         top_layout.addStretch(1)
 
         self.ros_state_label = self._status_label("ROS 连接中")
+        # 飞机在线/离线（靠 /inventory_status 心跳判定，区别于上面的地面站自身 ROS 连接）。
+        self.uav_link_label = self._status_label("飞机: 未连接")
+        # 飞机当前阶段（待命/识别抽取码/盘点中…），直接来自飞机心跳文本。
+        self.uav_phase_label = self._status_label("状态: --")
+        self.uav_phase_label.setMinimumWidth(260)
         self.phase_label = self._status_label("任务: 待机")
         self.progress_label = self._status_label("进度: 0/24")
         self.target_label = self._status_label("目标: -")
         for widget in (
             self.ros_state_label,
+            self.uav_link_label,
+            self.uav_phase_label,
             self.phase_label,
             self.progress_label,
             self.target_label,
@@ -491,6 +515,26 @@ class GroundStationWindow(QMainWindow):
         controls_layout = QVBoxLayout(controls_panel)
         controls_layout.setContentsMargins(14, 14, 14, 14)
         controls_layout.setSpacing(16)
+
+        # ── 任务模式下发（放最上面、最大）：飞机重启后在 WAIT_MODE 待命，靠这两个按钮告知本轮 ──
+        mode_title = QLabel("任务模式（飞机重启后必须下发）")
+        mode_title.setObjectName("sectionTitle")
+        controls_layout.addWidget(mode_title)
+
+        self.traverse_mode_button = QPushButton("普通任务\n要求1 遍历")
+        self.traverse_mode_button.clicked.connect(lambda: self.send_mission_mode("traverse"))
+        self.directed_mode_button = QPushButton("进阶任务\n要求2 定向")
+        self.directed_mode_button.clicked.connect(lambda: self.send_mission_mode("directed"))
+        for button in (self.traverse_mode_button, self.directed_mode_button):
+            button.setObjectName("modeButton")
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            button.setMinimumHeight(104)
+            controls_layout.addWidget(button)
+
+        self.mode_status_label = QLabel("尚未下发任务模式")
+        self.mode_status_label.setObjectName("queryResult")
+        self.mode_status_label.setWordWrap(True)
+        controls_layout.addWidget(self.mode_status_label)
 
         controls_title = QLabel("定点控制")
         controls_title.setObjectName("sectionTitle")
@@ -578,6 +622,7 @@ class GroundStationWindow(QMainWindow):
         self.bridge.led_blink.connect(self.blink_led)
         self.bridge.mission_complete.connect(self.handle_mission_complete)
         self.bridge.connection_state.connect(self.ros_state_label.setText)
+        self.bridge.uav_status.connect(self.handle_uav_status)
         self.bridge.error.connect(self.show_error)
 
     def _refresh_all(self) -> None:
@@ -605,7 +650,33 @@ class GroundStationWindow(QMainWindow):
                     item.setBackground(QColor("#ffebee"))
                 self.result_table.setItem(row, col, item)
 
+    def handle_uav_status(self, text: str) -> None:
+        # 收到飞机心跳：记录时刻 + 文本，立即刷新顶栏（在线灯 + 阶段文字）。
+        self._uav_last_seen = time.monotonic()
+        self._uav_status_text = text or "--"
+        self._refresh_uav_link()
+
+    def _refresh_uav_link(self) -> None:
+        # 据最近一次心跳时间判在线/离线。ui_timer(500ms) 周期调，断流即变离线。
+        online = (
+            self._uav_last_seen is not None
+            and (time.monotonic() - self._uav_last_seen) <= self._uav_offline_sec
+        )
+        if online:
+            self.uav_link_label.setText("飞机: 在线")
+            self.uav_link_label.setStyleSheet("color: #1b5e20; font-weight: bold;")
+            self.uav_phase_label.setText(f"状态: {self._uav_status_text}")
+            self.uav_phase_label.setStyleSheet("")
+        else:
+            self.uav_link_label.setText("飞机: 离线")
+            self.uav_link_label.setStyleSheet("color: #b71c1c; font-weight: bold;")
+            # 离线时把阶段灰掉，避免误以为还在动；保留最后已知文字带个“(失联)”。
+            last = self._uav_status_text if self._uav_last_seen is not None else "--"
+            self.uav_phase_label.setText(f"状态: {last}（失联）" if self._uav_last_seen else "状态: --")
+            self.uav_phase_label.setStyleSheet("color: #9e9e9e;")
+
     def _refresh_status_labels(self) -> None:
+        self._refresh_uav_link()
         completed = self.store.completed_count()
         self.progress_label.setText(f"进度: {completed}/24")
 
@@ -631,11 +702,14 @@ class GroundStationWindow(QMainWindow):
         self.query_input.setText(str(item_id))
         found = self.store.find_item(item_id)
         if found is None:
-            self.query_result_label.setText(f"目标编号 {item_id} 尚未在遍历结果中找到")
+            self.query_result_label.setText(
+                f"✅ 已识别抽取码：编号 {item_id}，但它不在本轮遍历结果里，无法下发货位")
             self.map_widget.set_target_slot(None)
             self._refresh_status_labels()
             return
         slot, _result = found
+        self.query_result_label.setText(
+            f"✅ 已识别抽取码：编号 {item_id} → 库位 {slot}，正在下发…")
         self._select_slot(slot)
         self.publish_waypoint(item_id, slot)
 
@@ -649,6 +723,15 @@ class GroundStationWindow(QMainWindow):
             self._select_slot(slot)
         self.query_result_label.setText(f"无人机已确认目标 货物 {item_id} -> 库位 {slot}，开始直飞盘点")
         self._refresh_status_labels()
+
+    def send_mission_mode(self, mode: str) -> None:
+        # 下发本轮任务模式给待命的飞机。普通=要求1 遍历；进阶=要求2 定向。
+        label = "普通任务（要求1 遍历）" if mode == "traverse" else "进阶任务（要求2 定向）"
+        if self.bridge.publish_mode(mode):
+            self.mode_status_label.setText(f"已下发：{label}")
+            self.query_result_label.setText(f"已通知飞机本轮执行【{label}】。")
+        else:
+            self.mode_status_label.setText(f"下发失败（ROS 未连接）：{label}")
 
     def handle_mission_complete(self) -> None:
         self.store.update_mission_status({"phase": "完成"})
@@ -923,6 +1006,19 @@ QPushButton:pressed {
     font-size: 28px;
     padding: 22px 18px;
     margin: 3px 0;
+}
+#modeButton {
+    font-size: 30px;
+    font-weight: 700;
+    padding: 18px;
+    margin: 4px 0;
+    color: #ffffff;
+    background: #2f6f4f;
+    border: 2px solid #1f5237;
+    border-radius: 8px;
+}
+#modeButton:pressed {
+    background: #24593f;
 }
 #queryResult {
     color: #263238;
