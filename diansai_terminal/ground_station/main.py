@@ -46,6 +46,7 @@ if __package__ in (None, ""):
         waypoint_map,
     )
     from ground_station.ros_bridge import RosBridge
+    from ground_station.gpio_led import GpioLed
 else:
     from .models import (
         SLOTS,
@@ -55,6 +56,7 @@ else:
         waypoint_map,
     )
     from .ros_bridge import RosBridge
+    from .gpio_led import GpioLed
 
 
 class TouchLineEdit(QLineEdit):
@@ -424,7 +426,9 @@ class WarehouseMap(QWidget):
 
 
 class GroundStationWindow(QMainWindow):
-    def __init__(self, start_ros: bool = True, demo: bool = False) -> None:
+    def __init__(self, start_ros: bool = True, demo: bool = False,
+                 led_pin: int = 13, led_on_level: int = 0,
+                 led_off_level: int = 1) -> None:
         super().__init__()
         self.config = load_waypoint_config()
         self.waypoints = waypoint_map(self.config)
@@ -434,6 +438,11 @@ class GroundStationWindow(QMainWindow):
         # 不依赖重启重载；所以重启=开新一轮，清空避免上轮旧结果残留误导。
         self.store.clear_results()
         self.bridge = RosBridge()
+
+        # 物理 LED 灯：和飞机激光同一套 WiringOP gpio 接口（pin13/on低）。每盘点一个亮灭 1s。
+        # 没装 WiringOP / 跑在开发机时静默降级，只闪屏不碰 GPIO。
+        self.led_gpio = GpioLed(pin=led_pin, on_level=led_on_level,
+                                off_level=led_off_level)
 
         # 飞机心跳：最近一次收到 /inventory_status 的时刻 + 文本。超时未收到即判离线。
         self._uav_last_seen: float | None = None
@@ -834,10 +843,13 @@ class GroundStationWindow(QMainWindow):
         self._refresh_all()
 
     def blink_led(self) -> None:
+        # 屏幕 LED 方块闪 1s（保留，好看）。
         self.led_indicator.setProperty("active", True)
         self.led_indicator.style().unpolish(self.led_indicator)
         self.led_indicator.style().polish(self.led_indicator)
         QTimer.singleShot(1000, self._reset_led)
+        # 物理 LED 灯同步亮灭 1s（和飞机激光同款 gpio 控制，子线程不阻塞 UI）。
+        self.led_gpio.blink(1.0)
 
     def _reset_led(self) -> None:
         self.led_indicator.setProperty("active", False)
@@ -874,6 +886,7 @@ class GroundStationWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event: Any) -> None:
+        self.led_gpio.close()
         self.bridge.stop()
         super().closeEvent(event)
 
@@ -1105,6 +1118,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-ros", action="store_true", help="Start UI without ROS bridge")
     parser.add_argument("--demo", action="store_true", help="Load demo inventory data")
     parser.add_argument("--smoke-test", action="store_true", help="Open briefly and exit")
+    # 物理 LED 灯（同飞机激光 WiringOP gpio 接口；-1=不控，只闪屏）。默认照激光 pin13/on低。
+    parser.add_argument("--led-pin", type=int, default=13,
+                        help="WiringOP pin for physical LED (-1 to disable, default 13)")
+    parser.add_argument("--led-on-level", type=int, default=0,
+                        help="GPIO level that lights the LED (default 0, low=on)")
+    parser.add_argument("--led-off-level", type=int, default=1,
+                        help="GPIO level that turns the LED off (default 1)")
     return parser.parse_args(argv)
 
 
@@ -1112,7 +1132,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv[:1])
-    window = GroundStationWindow(start_ros=not args.no_ros, demo=args.demo)
+    window = GroundStationWindow(
+        start_ros=not args.no_ros,
+        demo=args.demo,
+        led_pin=args.led_pin,
+        led_on_level=args.led_on_level,
+        led_off_level=args.led_off_level,
+    )
     app.aboutToQuit.connect(window.bridge.stop)
 
     if args.smoke_test:
