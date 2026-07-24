@@ -9,14 +9,24 @@
 # autostart_fly.sh 已自动 source 本脚本。手动联调时在 ros2 launch 前先 source。
 #
 # 关键点（两端必须一致）：
-#   ROS_DOMAIN_ID         同域才能互相发现，默认 26（可用环境变量覆盖）
+#   ROS_DOMAIN_ID         同域才能互相发现，固定 26（强制覆盖外部值，
+#                         临时改域用 DIANSAI_DOMAIN_ID）
 #   ROS_LOCALHOST_ONLY=0  跨机通信必须为 0（=1 只走本机回环，发现不到对端）
 #   RMW_IMPLEMENTATION    统一用 FastDDS（rmw_fastrtps_cpp），两端 RMW 必须相同
 #
 # 注意：本脚本只导出环境变量，不 source ROS（humble 已在 .bashrc / autostart 里 source）。
 
 # —— 同一网络下两端必须相同 ——
-export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-26}"
+# 强制覆盖：不沿用外部已有的 ROS_DOMAIN_ID。.bashrc / systemd 里残留的
+# ROS_DOMAIN_ID=0 曾把本脚本静默劫持到默认域 0（谁都能进来的公共域）。
+# 要临时换域，用 DIANSAI_DOMAIN_ID（两端必须给同一个值）：
+#   DIANSAI_DOMAIN_ID=31 source scripts/setup_dds.sh
+_WANT_DOMAIN="${DIANSAI_DOMAIN_ID:-26}"
+if [ -n "${ROS_DOMAIN_ID:-}" ] && [ "${ROS_DOMAIN_ID}" != "$_WANT_DOMAIN" ]; then
+  echo "[dds] 覆盖外部 ROS_DOMAIN_ID=${ROS_DOMAIN_ID} → ${_WANT_DOMAIN}"
+fi
+export ROS_DOMAIN_ID="$_WANT_DOMAIN"
+unset _WANT_DOMAIN
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 

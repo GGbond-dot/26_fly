@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 停止自启/试飞的所有进程（盘点自启 + 手动 run_test 都覆盖）
+# 停止自启/试飞的所有进程（消防自启 + 手动 run_test 都覆盖）
 # ⚠ launch 名跟着 autostart_fly.sh 的 LAUNCH_PKG/LAUNCH_FILE 走，改一处要同步改另一处。
 
 LOG_DIR="${FLY_LOG_DIR:-$HOME/fly_logs}"
@@ -90,13 +90,14 @@ echo "[stop] stopping fly processes..."
 # 与 autostart_fly.sh 保持同一套 env 默认值：默认值若改了，这里自动跟着匹配。
 # ⚠ 改 autostart_fly.sh 的 LAUNCH_PKG/LAUNCH_FILE 时，务必同步本处（两脚本要一致）。
 LAUNCH_PKG="${AUTOSTART_PKG:-my_launch}"
-LAUNCH_FILE="${AUTOSTART_LAUNCH:-inventory_full.launch.py}"
+LAUNCH_FILE="${AUTOSTART_LAUNCH:-fire_full.launch.py}"
 
 pkill -INT -f "ros2 bag record"
 sleep 1
-# 当前自启的盘点 launch（按 env 默认值匹配）
+# 当前自启的消防 launch（按 env 默认值匹配）
 pkill -INT -f "ros2 launch $LAUNCH_PKG $LAUNCH_FILE"
-# 兜底：旧的搬运/植保 launch 名（历史自启遗留）
+# 兜底：旧的盘点/搬运/植保 launch 名（历史自启遗留）
+pkill -INT -f "ros2 launch my_launch inventory_full.launch.py"
 pkill -INT -f "ros2 launch my_launch spray_basic.launch.py"
 pkill -INT -f "ros2 launch my_launch demo3.launch.py"
 sleep 1

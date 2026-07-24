@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fire_video_link_pkg</name>
+  <version>0.1.0</version>
+  <description>无人机↔消防车 跨 ROS_DOMAIN_ID 话题桥，用于把视频流从飞机内部域搬到与车共享的域</description>
+  <maintainer email="nguyenngocmy9575@gmail.com">kian</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+
+  <!-- 运行时按名字动态加载消息类型，桥本身不 link 这些包，
+       但转发 sensor_msgs/msg/Image 时它们必须已安装 -->
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>fire_vision_pkg</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

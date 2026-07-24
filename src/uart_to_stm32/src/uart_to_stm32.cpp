@@ -102,6 +102,12 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
       "/led_digit", rclcpp::QoS(10),
       std::bind(&UartToStm32::ledDigitCallback, this, std::placeholders::_1));
 
+    // G 题（消防）：抛洒灭火包，1B state，帧 0x13。香橙派只发标志位，
+    // 舵机开合角度/时长全部由飞控固件实现（本机不接舵机）。
+    drop_package_sub_ = node_->create_subscription<std_msgs::msg::UInt8>(
+      "/drop_package", rclcpp::QoS(10),
+      std::bind(&UartToStm32::dropPackageCallback, this, std::placeholders::_1));
+
     mission_complete_sub_ = node_->create_subscription<std_msgs::msg::Empty>(
       "/mission_complete", rclcpp::QoS(10),
       std::bind(&UartToStm32::missionCompleteCallback, this, std::placeholders::_1));
@@ -118,8 +124,10 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
 
     has_st_ready_pub_ = false;
 
-    // 上电安全初始化：机械臂收起 + 电磁铁断电 + 蜂鸣器/LED 关闭
-    sendServoToSerial(0x00);
+    // 上电安全初始化：抛投舵机关闭(700) + 电磁铁断电 + 蜂鸣器/LED 关闭
+    // 注意：抛投舵机与机械臂共用 0x11 帧，这里必须走 sendDropPackageToSerial，
+    // 否则 sendServoToSerial(0x00) 会发出 DATA=0x00 -> 1400，上电即打开抛投。
+    sendDropPackageToSerial(0x00);
     sendElectromagnetToSerial(0x00);
     sendBuzzerLedToSerial(0x00);
 
@@ -450,29 +458,11 @@ void UartToStm32::protocolDataHandler(uint8_t id, const std::vector<uint8_t> & d
   }
 }
 
+// /servo_control 与 /drop_package 是同一条硬件链路（飞控串口三舵机帧 0x11），
+// 这里统一成同一套语义：1=开(1400)，0=关(700)。留 /servo_control 作手动调试口。
 void UartToStm32::sendServoToSerial(uint8_t state)
 {
-  if (!serial_comm_ || !serial_comm_->is_open()) {
-    RCLCPP_WARN_THROTTLE(
-      node_->get_logger(), *node_->get_clock(), 5000,
-      "Serial port is not open, cannot send servo control data");
-    return;
-  }
-
-  std::vector<uint8_t> data(1, state);
-  if (serial_comm_->send_protocol_data(SERVO_FRAME_ID, static_cast<uint8_t>(data.size()), data)) {
-    RCLCPP_INFO(
-      node_->get_logger(),
-      "Sent servo frame: id=0x%02X state=0x%02X (%s)",
-      static_cast<unsigned>(SERVO_FRAME_ID),
-      static_cast<unsigned>(state),
-      state == 0x01 ? "down" : "up");
-  } else {
-    RCLCPP_WARN(
-      node_->get_logger(),
-      "Failed to send servo frame: %s",
-      serial_comm_->get_last_error().c_str());
-  }
+  sendDropPackageToSerial(state);
 }
 
 void UartToStm32::sendElectromagnetToSerial(uint8_t state)
@@ -564,6 +554,38 @@ void UartToStm32::sendLedDigitToSerial(uint8_t digit)
     RCLCPP_WARN(
       node_->get_logger(),
       "Failed to send LED digit frame: %s",
+      serial_comm_->get_last_error().c_str());
+  }
+}
+
+void UartToStm32::dropPackageCallback(const std_msgs::msg::UInt8::SharedPtr msg)
+{
+  sendDropPackageToSerial(msg->data);
+}
+
+void UartToStm32::sendDropPackageToSerial(uint8_t state)
+{
+  if (!serial_comm_ || !serial_comm_->is_open()) {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 5000,
+      "Serial port is not open, cannot send drop package data");
+    return;
+  }
+
+  // state: 1=抛投(舵机 1400/开) -> DATA 0x00; 0=复位(舵机 700/关) -> DATA 0x01
+  const uint8_t servo_data = (state == 0x01) ? SERVO_DATA_OPEN : SERVO_DATA_CLOSED;
+  std::vector<uint8_t> data(1, servo_data);
+  if (serial_comm_->send_protocol_data(DROP_PACKAGE_FRAME_ID, static_cast<uint8_t>(data.size()), data)) {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Sent drop package frame: id=0x%02X data=0x%02X (%s)",
+      static_cast<unsigned>(DROP_PACKAGE_FRAME_ID),
+      static_cast<unsigned>(servo_data),
+      state == 0x01 ? "drop/open 1400" : "reset/close 700");
+  } else {
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "Failed to send drop package frame: %s",
       serial_comm_->get_last_error().c_str());
   }
 }

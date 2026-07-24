@@ -1,0 +1,31 @@
+# 跨域话题桥配置（飞机侧）
+#
+# 规则格式： "源话题|目标话题|类型|可靠性|队列深度"
+#   源话题   —— 飞机内部域(inner_domain)上已存在的话题名
+#   目标话题 —— 共享域(outer_domain)上发布的名字，统一加 /fly 前缀跟车端话题分开
+#   类型     —— 完整消息类型，必须和源话题实际类型**逐字一致**，
+#                写错不会报错、只会一帧收不到（用 `ros2 topic info <话题>` 查）
+#   可靠性   —— best_effort（图像流用这个）/ reliable
+#   队列深度 —— 图像用 1~5，太大只会堆积延迟
+#
+# 加话题只改这里，不用重新编译（桥不反序列化，不依赖具体消息包）。
+
+fire_video_bridge_cfg:
+  ros__parameters:
+    inner_domain: 26      # 飞机内部域（scripts/setup_dds.sh 固定 26）
+    outer_domain: 6       # 消防车所在域（2026-07-23 与队友确认）
+    stats_period_sec: 5.0 # 吞吐日志周期，0 = 关闭
+
+    rules:
+      # 下视相机通用图传。源话题是 /camera/down/compressed（与火源检测无关，
+      # 检测关掉也照发）；目标名暂时保留 /fly/fire/debug_image/compressed，
+      # 因为车端已经按这个名字写好了，改名要队友同步改一行 yaml。
+      #
+      # 传 CompressedImage 而不是 Image：原始 640x480x3@15Hz≈13MB/s 会挤掉
+      # fire_link_pkg 的 UDP 控制包（遥测/按键启动），那是基本要求的分。
+      # 发送侧的限频/限带宽在 fire_vision_pkg 的 stream_* 参数里。
+      - "/camera/down/compressed|/fly/fire/debug_image/compressed|sensor_msgs/msg/CompressedImage|best_effort|1"
+
+      # 下面几条按需放开：
+      # - "/fire/detected|/fly/fire/detected|std_msgs/msg/Bool|reliable|5"
+      # - "/fire_status|/fly/fire_status|std_msgs/msg/String|reliable|5"

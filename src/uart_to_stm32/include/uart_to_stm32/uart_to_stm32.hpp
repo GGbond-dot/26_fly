@@ -48,6 +48,8 @@ private:
   void sendBuzzerLedToSerial(uint8_t state);
   void ledDigitCallback(const std_msgs::msg::UInt8::SharedPtr msg);
   void sendLedDigitToSerial(uint8_t digit);
+  void dropPackageCallback(const std_msgs::msg::UInt8::SharedPtr msg);
+  void sendDropPackageToSerial(uint8_t state);
   void missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr msg);
   void laserGroundHeightCallback(const std_msgs::msg::Int16::SharedPtr msg);
   void sendLaserGroundHeightToSerial(int16_t height_cm);
@@ -68,6 +70,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr electromagnet_control_sub_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr buzzer_led_control_sub_;
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr led_digit_sub_;
+  rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr drop_package_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr mission_complete_sub_;
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr laser_ground_height_sub_;
 
@@ -87,11 +90,19 @@ private:
   static constexpr uint8_t VELOCITY_FRAME_ID = 0x32;
   static constexpr uint8_t TARGET_VELOCITY_FRAME_ID = 0x31;
   static constexpr uint8_t ST_READY_QUERY_ID = 0xF1;
-  static constexpr uint8_t SERVO_FRAME_ID = 0x11;          // 0x01=放下机械臂, 0x00=收起机械臂
+  // 舵机帧（搬运题=机械臂，消防题=抛投舱，同一条硬件链路）。
+  // /servo_control 已并入 /drop_package，见 sendServoToSerial()。
+  static constexpr uint8_t SERVO_FRAME_ID = 0x11;
   static constexpr uint8_t ELECTROMAGNET_FRAME_ID = 0x33;  // 0x01=通电(吸), 0x00=断电(松)
   static constexpr uint8_t BUZZER_LED_FRAME_ID = 0x22;     // 0x01=蜂鸣器+LED开, 0x00=关（声光绑同一帧）
   // G 题（spray-task）新增：1B digit, LED 闪烁该次数显示条形码数字
   static constexpr uint8_t LED_DIGIT_FRAME_ID = 0x12;
+  // G 题（消防）：复用飞控舵机帧 0x11（AnoDTRaspRecvOneByte 协议，串口三 921600 8N1）。
+  // 飞控固件：DATA==0x01 -> 舵机 700(关/夹住)，DATA!=0x01 -> 舵机 1400(开/抛投)，上电默认 700。
+  // ROS 侧 /drop_package 语义 1=抛投 / 0=复位，故发送时取反成 DATA。
+  static constexpr uint8_t DROP_PACKAGE_FRAME_ID = 0x11;
+  static constexpr uint8_t SERVO_DATA_CLOSED = 0x01;  // -> 700
+  static constexpr uint8_t SERVO_DATA_OPEN = 0x00;    // -> 1400
   static constexpr uint8_t MISSION_COMPLETE_FRAME_ID = 0x66;
   static constexpr uint8_t MISSION_COMPLETE_VALUE = 0x06;
   static constexpr uint8_t LASER_GROUND_HEIGHT_FRAME_ID = 0x07;  // 2B int16 little-endian, 单位 cm
